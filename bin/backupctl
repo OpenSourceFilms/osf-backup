@@ -1,0 +1,1485 @@
+#!/workspace/_BACKUP/.venv/bin/python
+"""CLI for the selective backup system installed under /workspace/_BACKUP."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import logging
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta, time as dt_time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+BACKUP_HOME = Path(
+    os.environ.get("BACKUP_HOME", Path(__file__).resolve().parent.parent)
+).expanduser()
+if str(BACKUP_HOME) not in sys.path:
+    sys.path.insert(0, str(BACKUP_HOME))
+
+import yaml  # noqa: E402
+
+from app.policy import Policy, FileCandidate  # noqa: E402
+from app.scanner import scan as scan_source, Candidate, CandidateStatus  # noqa: E402
+from app import scanner as app_scanner  # noqa: E402
+from app.storage import RunPodStorage, MissingCredentials, ListPrefixLimitExceeded  # noqa: E402
+from app import healthcheck as app_healthcheck  # noqa: E402
+from app import notify_email as app_notify_email  # noqa: E402
+from app import notify_ntfy as app_notify_ntfy  # noqa: E402
+from app import restore as app_restore  # noqa: E402
+from app import retention as app_retention  # noqa: E402
+from app import runner as app_runner  # noqa: E402
+import app.wiring  # noqa: E402
+from app.wiring import (  # noqa: E402
+    BLOB_CACHE_DIR,
+    POLICY_PATH,
+    RUNTIME_PATH,
+    STAGING_DIR,
+    STATE_DB_PATH,
+    _build_storage,
+    _key_prefix,
+    _load_policy,
+    _load_policy_yaml,
+    _load_runtime_yaml,
+    _open_state_db,
+    _source_root,
+)
+
+MELBOURNE = ZoneInfo("Australia/Melbourne")
+LOG = logging.getLogger("backupctl")
+MIN_FREE_BYTES_DEFAULT = 1024**3
+
+
+def _next_melbourne_run(raw_runtime: dict) -> datetime:
+    hh, mm = (int(part) for part in str(raw_runtime["schedule"]["time"]).split(":"))
+    now = datetime.now(MELBOURNE)
+    candidate = datetime.combine(now.date(), dt_time(hh, mm), tzinfo=MELBOURNE)
+    if candidate <= now:
+        candidate = datetime.combine(
+            now.date() + timedelta(days=1), dt_time(hh, mm), tzinfo=MELBOURNE
+        )
+    return candidate
+
+
+def _read_transactions(state_db_path: Path) -> list[dict]:
+    """Read-only snapshot of app.runner.Runner's ``transactions`` table --
+    the real, sole source of truth for backup phase, most recent first.
+    Mirrors the same read-only-peek pattern app/backupd.py's
+    _get_transaction_phase and this module's _older_failed_transaction_date
+    already use against the same table. app.statedb.StateDB's separate,
+    older ``runs`` table is never written by Runner and must not be read
+    as if it reflected real backup state.
+
+    Returns [] when no transaction has ever run, including when the table
+    or the state DB file itself doesn't exist yet (a fresh install before
+    the first real run) -- never raises for that case.
+    """
+    if not Path(state_db_path).exists():
+        return []
+    conn = sqlite3.connect(str(state_db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT * FROM transactions ORDER BY txn_date DESC, created_at DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _last_success_run_date() -> str | None:
+    for txn in _read_transactions(STATE_DB_PATH):
+        if txn["phase"] == "SUCCESS":
+            return txn["txn_date"]
+    return None
+
+
+def _current_transaction(transactions: list[dict]) -> dict | None:
+    """The transaction still in progress, if any -- the most recent row
+    (``transactions`` is txn_date/created_at descending) whose phase is
+    neither terminal state (SUCCESS/FAILED). At most one is expected under
+    the one-transaction-per-Melbourne-day model, but this does not assume
+    that invariant; it's a read-only status report, not the place to
+    enforce it."""
+    return next(
+        (t for t in transactions if t["phase"] not in ("SUCCESS", "FAILED")),
+        None,
+    )
+
+
+def _abandoned_transactions(transactions: list[dict], today: str) -> list[dict]:
+    """Non-terminal transactions belonging to an earlier day than ``today``.
+
+    A transaction sitting at SCANNING/UPLOADING/VERIFYING/COMMITTING/
+    POST_VERIFY on a past date is not "in progress" -- nothing is working
+    on it. Runner only ever advances a transaction from inside a live
+    process, and backupd only ever considers *today's* date (see
+    app/backupd.py's main loop, and its
+    test_old_abandoned_scanning_later_success_runs_current_date), so
+    yesterday's half-finished row will sit there untouched forever.
+
+    This is exactly the shape a SIGKILL or a pod restart leaves behind
+    (backup-2026-08-29 is a real one), and until 2026-09-07 `backupctl
+    status` reported it as "Current transaction in progress" and doctor
+    said nothing at all -- so an abandoned transaction, along with any
+    staging artifacts and already-uploaded-but-never-referenced blobs it
+    holds, was invisible. Automation is not affected by it; the operator's
+    picture of reality is.
+    """
+    terminal = {"SUCCESS", "FAILED", "ABANDONED"}
+    return [
+        t
+        for t in transactions
+        if t["phase"] not in terminal and str(t["txn_date"]) < today
+    ]
+
+
+def _age_phrase(iso_timestamp: str | None) -> str:
+    """Human age of an ISO-8601 stamp, or a plain marker when unparseable
+    -- a status line must never crash on a malformed timestamp."""
+    if not iso_timestamp:
+        return "age unknown"
+    try:
+        then = datetime.fromisoformat(str(iso_timestamp))
+    except ValueError:
+        return "age unknown"
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=MELBOURNE)
+    delta = datetime.now(MELBOURNE) - then
+    days = delta.days
+    hours = delta.seconds // 3600
+    if days:
+        return f"{days}d {hours}h ago"
+    minutes = (delta.seconds % 3600) // 60
+    return f"{hours}h {minutes}m ago" if hours else f"{minutes}m ago"
+
+
+def _format_bytes(num):
+    if num is None:
+        return "unknown"
+    try:
+        num = float(num)
+    except (TypeError, ValueError):
+        return str(num)
+
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if abs(num) < 1024.0:
+            if unit == "B":
+                return f"{int(num)} {unit}"
+            return f"{num:.1f} {unit}"
+        num /= 1024.0
+    return f"{num:.1f} EiB"
+
+
+def _staging_warning_lines(report: dict) -> list[str]:
+    """WARN-level (never FAIL) staging observations for `backupctl
+    doctor`. Ownership matters more than raw size (Daniel, 2026-08-29): a
+    large git-rescue for a currently-running transaction can be
+    legitimate; a small leftover from a weeks-old SUCCESS is not. Always
+    warn on unknown-owner staging, staging owned by SUCCESS, and any
+    state/blob_cache/ content at all -- then layer size-based warnings on
+    top as a coarser secondary signal."""
+    lines = []
+
+    if report["blob_cache_bytes"] > 0:
+        lines.append(
+            f"state/blob_cache/ is not empty "
+            f"({_format_bytes(report['blob_cache_bytes'])}) -- production code "
+            "should never write here; see `backupctl staging-status`."
+        )
+
+    for txn in report["transactions"]:
+        if txn["unknown_owner"]:
+            lines.append(
+                f"{txn['txn_id']}: unknown-owner staging "
+                f"({_format_bytes(txn['bytes'])}) -- no matching transaction row."
+            )
+        elif txn["stale"]:
+            lines.append(
+                f"{txn['txn_id']}: staging owned by a SUCCESS transaction "
+                f"({_format_bytes(txn['bytes'])}) -- should have been cleaned; "
+                "run `backupctl staging-clean --dry-run`."
+            )
+
+    total_gib = report["total_staging_bytes"] / 1024**3
+    if total_gib > 25:
+        lines.append(
+            f"Total persistent staging is {total_gib:.1f} GiB -- CRITICAL, "
+            "investigate immediately."
+        )
+    elif total_gib > 10:
+        lines.append(
+            f"Total persistent staging is {total_gib:.1f} GiB -- well above "
+            "the expected range."
+        )
+    elif total_gib > 5:
+        lines.append(
+            f"Total persistent staging is {total_gib:.1f} GiB -- above the "
+            "expected idle range."
+        )
+
+    return lines
+
+
+def _cmd_status(_args):
+    try:
+        raw_policy = _load_policy_yaml()
+        raw_runtime = _load_runtime_yaml()
+        statedb = _open_state_db()
+
+        transactions = _read_transactions(STATE_DB_PATH)
+        latest = transactions[0] if transactions else None
+        last_success = _last_success_run_date()
+        current = _current_transaction(transactions)
+        next_run = _next_melbourne_run(raw_runtime)
+        usage = statedb.total_repository_bytes()
+        capacity = raw_policy["target"]["capacity_bytes"]
+
+        if latest:
+            print(
+                f"Latest transaction: {latest['txn_id']} "
+                f"(phase: {latest['phase']}, updated {latest['updated_at']})"
+            )
+        else:
+            print("Latest transaction: none (NEVER_STARTED)")
+
+        print(f"Last successful snapshot: {last_success or 'never'}")
+
+        today = datetime.now(MELBOURNE).date().isoformat()
+        abandoned = _abandoned_transactions(transactions, today)
+        abandoned_ids = {t["txn_id"] for t in abandoned}
+
+        if current and current["txn_id"] not in abandoned_ids:
+            print(
+                f"Current transaction in progress: {current['txn_id']} "
+                f"(phase: {current['phase']})"
+            )
+        else:
+            print("Current transaction in progress: none")
+
+        # Printed separately from "in progress" on purpose: these are past
+        # days' transactions that nothing will ever advance (see
+        # _abandoned_transactions). Calling them "in progress" -- the
+        # behaviour before 2026-09-07 -- reads as a healthy running backup.
+        for txn in abandoned:
+            resumable = txn["phase"] not in ("PENDING", "SCANNING")
+            advice = (
+                f"resume with `backupctl retry {txn['txn_date']}`"
+                if resumable
+                else "a resume would rescan from scratch anyway; "
+                "today's run is normally what you want"
+            )
+            print(
+                f"ABANDONED transaction: {txn['txn_id']} stuck at "
+                f"{txn['phase']}, last updated {_age_phrase(txn.get('updated_at'))} "
+                f"-- nothing is working on it; {advice}"
+            )
+
+        print(f"Next scheduled run (Australia/Melbourne): {next_run.isoformat()}")
+
+        try:
+            pct = (usage / capacity) * 100
+        except (ZeroDivisionError, TypeError):
+            pct = None
+
+        usage_str = _format_bytes(usage)
+        capacity_str = _format_bytes(capacity)
+        if pct is not None:
+            print(f"Repository usage: {usage_str} / {capacity_str} ({pct:.1f}%)")
+        else:
+            print(f"Repository usage: {usage_str} / {capacity_str}")
+
+        staging_report = app_runner.build_staging_report(
+            statedb.conn, STAGING_DIR, BLOB_CACHE_DIR
+        )
+        staging_line = f"Local staging: {_format_bytes(staging_report['total_staging_bytes'])}"
+        if staging_report["blob_cache_bytes"] > 0:
+            staging_line += (
+                f" (+ WARNING: {_format_bytes(staging_report['blob_cache_bytes'])} "
+                "in state/blob_cache/, which should be empty -- see `backupctl "
+                "staging-status`)"
+            )
+        print(staging_line)
+
+        _print_notification_status(latest)
+        return 0
+    except Exception:
+        LOG.error("status command failed", exc_info=True)
+        return 1
+
+
+def _print_notification_status(latest: dict | None) -> None:
+    """`backupctl status`'s "Notifications:" block -- one line per channel
+    showing whether it's configured, plus the most recent result recorded
+    against the latest transaction (see Runner._record_notification_result/
+    _record_healthchecks_result). Never sends anything; pure read of
+    config + the transactions row already fetched by the caller."""
+    ntfy = app_notify_ntfy.NtfyClient()
+    email = app_notify_email.EmailClient()
+    healthcheck = app_healthcheck.HealthcheckClient()
+
+    print("Notifications:")
+    print(f"  ntfy: {'enabled' if ntfy.enabled else 'disabled'}")
+    print(f"  Healthchecks: {'configured' if healthcheck.url else 'not configured'}")
+    print(f"  email: {'enabled' if email.enabled else 'disabled'}")
+
+    if not latest:
+        return
+
+    ntfy_status = latest.get("ntfy_status")
+    if ntfy_status is not None:
+        print(f"  Last ntfy notification: {ntfy_status} ({latest.get('updated_at')})")
+        ntfy_error = latest.get("ntfy_error")
+        if ntfy_error:
+            print(f"    error: {ntfy_error}")
+
+    hc_status = latest.get("healthchecks_last_status")
+    if hc_status is not None:
+        hc_kind = latest.get("healthchecks_last_kind") or "?"
+        print(f"  Last Healthchecks ping: {hc_status} ({hc_kind})")
+        hc_error = latest.get("healthchecks_last_error")
+        if hc_error:
+            print(f"    error: {hc_error}")
+
+    email_status = latest.get("notification_status")
+    if email_status is not None:
+        attempts = latest.get("notification_attempts")
+        print(f"  Last email notification: {email_status} (attempts: {attempts})")
+        email_error = latest.get("notification_error")
+        if email_error:
+            print(f"    error: {email_error}")
+
+
+def _classify_source_tree(policy: Policy, source_root: Path) -> dict:
+    """Walk source_root and classify every candidate. Read-only, no upload.
+
+    Git repositories (RepoCandidate) are skipped here -- they need
+    app.git_rescue's remote-state inspection, which this pass does not do.
+    """
+    by_class: dict[str, dict] = {}
+    unclassified: list[str] = []
+    deferred_active: list[str] = []
+    repo_paths: list[str] = []
+
+    for candidate in scan_source(source_root):
+        if not isinstance(candidate, Candidate):
+            repo_paths.append(candidate.relative_path)
+            continue
+        if candidate.status != CandidateStatus.OK:
+            deferred_active.append(candidate.relative_path)
+            continue
+
+        decision = policy.classify(
+            candidate.relative_path,
+            file_size=candidate.size,
+            mtime=candidate.mtime_ns / 1e9,
+        )
+        bucket = by_class.setdefault(
+            decision.classification.value,
+            {"count": 0, "bytes": 0, "selected_bytes": 0},
+        )
+        bucket["count"] += 1
+        bucket["bytes"] += candidate.size
+        if decision.selected:
+            bucket["selected_bytes"] += candidate.size
+        if decision.classification.value == "UNCLASSIFIED":
+            unclassified.append(candidate.relative_path)
+
+    return {
+        "generated_at": datetime.now(MELBOURNE).isoformat(),
+        "source_root": str(source_root),
+        "policy_hash": policy.policy_hash,
+        "by_classification": by_class,
+        "unclassified_paths": unclassified,
+        "deferred_active_paths": deferred_active,
+        "git_repo_paths": repo_paths,
+        "rejections": [
+            {"path": r.path, "reason": r.reason} for r in policy.rejections
+        ],
+    }
+
+
+def _write_report(prefix: str, report: dict) -> Path:
+    reports_dir = BACKUP_HOME / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(MELBOURNE).strftime("%Y%m%dT%H%M%S")
+    report_path = reports_dir / f"{prefix}-{stamp}.json"
+    tmp_path = report_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+    tmp_path.replace(report_path)
+    return report_path
+
+
+def _cmd_inventory(_args):
+    try:
+        raw_policy = _load_policy_yaml()
+        policy = _load_policy()
+        report = _classify_source_tree(policy, _source_root(raw_policy))
+        report_path = _write_report("inventory", report)
+        print(f"Inventory report written to {report_path}")
+        return 0
+    except Exception:
+        LOG.error("inventory command failed", exc_info=True)
+        return 1
+
+
+def _cmd_dry_run(_args):
+    try:
+        raw_policy = _load_policy_yaml()
+        policy = _load_policy()
+        report = _classify_source_tree(policy, _source_root(raw_policy))
+
+        capacity_bytes = raw_policy["target"]["capacity_bytes"]
+        selected_bytes = sum(
+            bucket["selected_bytes"] for bucket in report["by_classification"].values()
+        )
+        report["capacity_bytes"] = capacity_bytes
+        report["projected_selected_bytes"] = selected_bytes
+        report["projected_usage_fraction"] = (
+            selected_bytes / capacity_bytes if capacity_bytes else None
+        )
+        report["would_exceed_capacity"] = (
+            capacity_bytes is not None and selected_bytes > capacity_bytes
+        )
+
+        report_path = _write_report("dry-run", report)
+        print(f"Dry-run report written to {report_path}")
+        print(
+            f"Projected selected: {_format_bytes(selected_bytes)} / "
+            f"{_format_bytes(capacity_bytes)}"
+        )
+        if report["unclassified_paths"]:
+            print(
+                f"WARNING: {len(report['unclassified_paths'])} unclassified "
+                "path(s) -- see report, not silently included or dropped."
+            )
+        if report["would_exceed_capacity"]:
+            print("WARNING: projected selection would exceed capacity.")
+        return 0
+    except Exception:
+        LOG.error("dry-run command failed", exc_info=True)
+        return 1
+
+
+def _older_failed_transaction_date(state_db, target_date: str) -> str | None:
+    """Return another date's still-FAILED transaction, if any.
+
+    `run` always targets *today* (Runner.run() -> run_for_date(melbourne
+    today)) -- so if an older date is sitting FAILED, the operator most
+    likely means `backupctl retry <that date>`, not `run`. This is exactly
+    the real mistake made and self-caught during the 2026-08-19/20 seed
+    (see HANDOFF.md checkpoint -3i): a plain `run` after a date rollover
+    silently started a brand new transaction and rescan instead of
+    resuming the failed one. Deliberately not gated on how "cheap" the
+    resume would be (resume_phase) -- `retry <date>` is always the correct
+    next command for an older FAILED transaction, whether it resumes
+    cleanly or needs a full rescan.
+
+    Only *unresolved* failures block. A FAILED transaction older than the
+    most recent SUCCESS has already been superseded: the data it was
+    protecting is covered by the later successful snapshot, and the failed
+    date is kept solely as historical evidence (backup-2026-08-19 is
+    exactly this -- an incomplete old-policy scan Daniel has ruled must
+    stay FAILED and untouched). Without the "newer than latest SUCCESS"
+    clause that single historical row blocks `backupctl run` for every
+    future date forever, which would silently convert an unattended
+    nightly schedule into a permanent no-op.
+    """
+    row = state_db.execute(
+        """
+        SELECT txn_date
+          FROM transactions
+         WHERE phase = 'FAILED'
+           AND txn_date != ?
+           AND txn_date > COALESCE(
+                   (SELECT MAX(txn_date) FROM transactions WHERE phase = 'SUCCESS'),
+                   ''
+               )
+         ORDER BY txn_date
+         LIMIT 1
+        """,
+        (target_date,),
+    ).fetchone()
+    return row["txn_date"] if row else None
+
+
+# Matched against full command lines, so these MUST be this installation's
+# own paths, not bare basenames. Found 2026-09-07: the previous value
+# ("supervisor.sh", "backupd.py") matched
+# `/workspace/.pod-persist/bin/rtfm-supervisor.sh --daemon` -- RTFM's
+# supervisor, nothing to do with backups -- which permanently refused every
+# `backupctl run`/`retry`/`abandon` on this pod with a message telling the
+# operator to kill a process that was never the backup daemon. A guard that
+# false-positives on an unrelated always-running process is worse than no
+# guard: it trains the operator to reach for --allow-daemon-active, which
+# is exactly the flag that permits the concurrent-writer corruption the
+# guard exists to prevent.
+DAEMON_PROCESS_PATTERNS = (
+    str(BACKUP_HOME / "bin" / "supervisor.sh"),
+    str(BACKUP_HOME / "app" / "backupd.py"),
+    "app.backupd",  # `python -m app.backupd`
+)
+
+
+def _add_allow_daemon_active(parser) -> None:
+    parser.add_argument(
+        "--allow-daemon-active",
+        action="store_true",
+        help=(
+            "Proceed even though supervisor.sh/backupd.py are running. "
+            "Without this, run/retry refuse rather than compete with the "
+            "daemon for the state DB. Never kills the daemon for you."
+        ),
+    )
+
+
+def _active_daemon_processes() -> list[tuple[int, str]]:
+    """Return (pid, cmdline) for any running supervisor/backupd process.
+
+    Reads /proc directly rather than shelling out to pgrep: no dependency
+    on the host having procps, and -- importantly -- no risk of the
+    self-matching bug that has bitten this project twice, where a pattern
+    appearing in the issuing shell's own command line made it match (and
+    kill) itself. This compares against our own PID explicitly.
+    """
+    found: list[tuple[int, str]] = []
+    self_pid = os.getpid()
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return found
+
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == self_pid:
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue  # process exited, or not ours to read
+        cmdline = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        if not cmdline:
+            continue
+        if any(pat in cmdline for pat in DAEMON_PROCESS_PATTERNS):
+            found.append((pid, cmdline))
+
+    return found
+
+
+def _lock_is_held(lock_path: Path) -> bool:
+    """True if some other live process holds an exclusive flock on lock_path.
+
+    Deliberately not a pidfile/liveness check: if the OS lets us take the
+    lock, whatever last held it is not running -- the kernel releases
+    flock() locks on process exit, even a crash. That guarantee is exactly
+    why bin/supervisor.sh and app/backupd.py use flock as their own
+    liveness mechanism, and why this reuses the same real mechanism.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False  # we could take it -- nothing was holding it
+    except OSError:
+        return True  # held by a live process
+    finally:
+        os.close(fd)
+
+
+def _held_daemon_locks() -> list[str]:
+    """Which of this installation's own daemon locks are currently held.
+
+    This -- not command-line matching -- is the authoritative answer to "is
+    unattended scheduling live". Found 2026-09-07 during the first real
+    restart test: the running supervisor's cmdline is whatever the operator
+    typed, e.g. `bash bin/supervisor.sh` (relative), so absolute-path
+    patterns miss it and bare basenames match unrelated processes like
+    rtfm-supervisor.sh. Both directions were live bugs; the flock is
+    immune to both, since it is the same lock the daemon itself takes.
+    """
+    held = []
+    for label, path in (
+        ("supervisor", BACKUP_HOME / "logs" / "supervisor.lock"),
+        ("daemon", BACKUP_HOME / "state" / "backupd.lock"),
+    ):
+        try:
+            if _lock_is_held(path):
+                held.append(f"{label} ({path} is locked)")
+        except OSError:
+            continue
+    return held
+
+
+def _assert_no_active_daemon(allow: bool) -> bool:
+    """Fail closed if unattended scheduling is live. Never kills anything.
+
+    A manual `backupctl run` started while supervisor.sh/backupd.py were
+    still running is exactly what happened on 2026-08-23: the operator
+    believed unattended scheduling was disabled, and the daemon had in fact
+    been running since 2026-08-16. Two writers against one state DB and one
+    bucket is a corruption risk, so this refuses rather than warns --
+    stopping a daemon is an operator decision, not something a CLI should
+    do behind the operator's back.
+    """
+    # Locks first: they are authoritative and name-independent. The
+    # command-line scan only enriches the message with pids, and can
+    # legitimately find nothing when the daemon was started under a
+    # command line these patterns don't match.
+    locks = _held_daemon_locks()
+    active = _active_daemon_processes()
+    if not locks and not active:
+        return True
+
+    listing = "\n".join(
+        [f"    lock held: {entry}" for entry in locks]
+        + [f"    pid {pid}: {cmd}" for pid, cmd in active]
+    )
+    if allow:
+        LOG.warning(
+            "Unattended backup scheduling is ACTIVE while running manually:\n%s\n"
+            "Proceeding anyway because --allow-daemon-active was given.",
+            listing,
+        )
+        return True
+
+    LOG.error(
+        "Refusing to start: unattended backup scheduling appears to be ACTIVE.\n"
+        "%s\n"
+        "Two writers against one state DB and one bucket can corrupt a transaction.\n"
+        "Stop it first (send SIGTERM to bin/supervisor.sh -- it restarts backupd.py\n"
+        "about 10s after any exit, so killing backupd.py alone is not enough), then\n"
+        "re-run. Use --allow-daemon-active only if concurrent execution is intended.",
+        listing,
+    )
+    return False
+
+
+def _explain_sqlite_lock(exc: BaseException) -> bool:
+    """Turn a SQLite busy/lock error into an explicit operator diagnostic.
+
+    Without this a contended state DB surfaces as a backup that simply
+    appears to hang -- which is how two leftover read-only diagnostic
+    scripts were nearly mistaken for a stalled run before the seed.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    if "lock" not in message and "busy" not in message:
+        return False
+
+    LOG.error(
+        "State database is locked by another process: %s\n"
+        "    state DB: %s\n"
+        "This is contention, NOT a hung or slow backup.\n"
+        "Identify the holders with:  fuser -v %s\n"
+        "Long-running read-only diagnostic scripts count as holders.",
+        exc,
+        STATE_DB_PATH,
+        STATE_DB_PATH,
+    )
+    return True
+
+
+def _cmd_run(args):
+    try:
+        if not _assert_no_active_daemon(getattr(args, "allow_daemon_active", False)):
+            return 2
+        runner = app.wiring.build_runner()
+
+        target_date = runner._melbourne_today()
+        if not args.force_new_date:
+            blocking_date = _older_failed_transaction_date(runner.state_db, target_date)
+            if blocking_date:
+                LOG.error(
+                    "Resumable failed backup exists: backup-%s.\n"
+                    "Use: backupctl retry %s\n"
+                    "Use --force-new-date only if a new daily transaction is intentional.",
+                    blocking_date,
+                    blocking_date,
+                )
+                return 1
+
+        runner.run()
+        print("Run completed successfully.")
+        return 0
+    except Exception as exc:
+        if _explain_sqlite_lock(exc):
+            return 1
+        LOG.error("run command failed", exc_info=True)
+        return 1
+
+
+def _cmd_retry(args):
+    try:
+        if not _assert_no_active_daemon(getattr(args, "allow_daemon_active", False)):
+            return 2
+        runner = app.wiring.build_runner()
+        runner.run_for_date(args.date)
+        print(f"Retry of {args.date} completed successfully.")
+        return 0
+    except Exception as exc:
+        if _explain_sqlite_lock(exc):
+            return 1
+        LOG.error("retry command failed", exc_info=True)
+        return 1
+
+
+def _cmd_abandon(args):
+    """Close an interrupted transaction as deliberately ABANDONED.
+
+    For a transaction whose process was killed mid-phase (SIGKILL, pod
+    restart) and which nothing will ever advance. Deletes nothing --
+    scan_items and any uploaded blobs stay put; this only records the truth
+    about the transaction row so it stops reading as "in progress" forever.
+    Runner.abandon_transaction does the write (single-writer principle) and
+    refuses anything already terminal.
+    """
+    try:
+        if not _assert_no_active_daemon(getattr(args, "allow_daemon_active", False)):
+            return 2
+        runner = app.wiring.build_runner()
+        runner.abandon_transaction(args.date, args.reason)
+        print(f"backup-{args.date} marked ABANDONED: {args.reason}")
+        return 0
+    except Exception as exc:
+        if _explain_sqlite_lock(exc):
+            return 1
+        LOG.error("abandon command failed: %s", exc)
+        return 1
+
+
+def _cmd_report(_args):
+    try:
+        reports_dir = BACKUP_HOME / "reports"
+        candidates = sorted(
+            reports_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True
+        ) if reports_dir.exists() else []
+        if not candidates:
+            print(f"No reports found under {reports_dir}")
+            return 1
+        print(candidates[0].read_text())
+        return 0
+    except Exception:
+        LOG.error("report command failed")
+        return 1
+
+
+def _cmd_snapshots(_args):
+    """Lists snapshots from the remote manifest index -- authoritative per
+    README ("Restore does not depend on local state"), not from state.sqlite.
+    """
+    try:
+        raw_policy = _load_policy_yaml()
+        storage = _build_storage(raw_policy)
+        snapshots = app_restore.list_snapshots(storage, _key_prefix(raw_policy))
+        if not snapshots:
+            print("No snapshots found.")
+            return 0
+        for date in snapshots:
+            print(date)
+        return 0
+    except Exception:
+        LOG.error("snapshots command failed", exc_info=True)
+        return 1
+
+
+def _cmd_verify(args):
+    try:
+        raw_policy = _load_policy_yaml()
+        storage = _build_storage(raw_policy)
+        prefix = _key_prefix(raw_policy)
+
+        date = args.date
+        if date is None:
+            snapshots = app_restore.list_snapshots(storage, prefix)
+            if not snapshots:
+                print("No snapshots found to verify.")
+                return 1
+            date = snapshots[0]
+
+        verification_cfg = raw_policy.get("verification", {})
+        sample_max_bytes = verification_cfg.get("daily_sample_max_bytes", 0)
+
+        report = app_restore.verify_snapshot(
+            storage, date, sample_max_bytes=sample_max_bytes, prefix=prefix
+        )
+        print(
+            f"Verify {report.date}: {report.verified_entries}/{report.total_entries} "
+            f"HeadObject-verified, {report.download_verified_entries} download+hash "
+            f"sampled, {report.failed_entries} failed."
+        )
+        for failure in report.failures:
+            print(f"  FAILED: {failure}")
+        return 0 if report.failed_entries == 0 else 1
+    except Exception:
+        LOG.error("verify command failed", exc_info=True)
+        return 1
+
+
+def _cmd_restore(args):
+    try:
+        raw_policy = _load_policy_yaml()
+        storage = _build_storage(raw_policy)
+        manifest = app_restore.load_manifest(storage, args.snapshot, _key_prefix(raw_policy))
+        report = app_restore.restore(
+            storage,
+            manifest,
+            path_filter=args.path,
+            destination=args.destination,
+            prefix=_key_prefix(raw_policy),
+        )
+        print(
+            f"Restore from snapshot {args.snapshot} path {args.path} "
+            f"to {args.destination}: {report.restored_entries} restored, "
+            f"{report.failed_entries} failed (of {report.total_entries})."
+        )
+        return 0 if report.failed_entries == 0 else 1
+    except Exception:
+        LOG.error("restore command failed", exc_info=True)
+        return 1
+
+
+def _cmd_rebuild_state(_args):
+    try:
+        raw_policy = _load_policy_yaml()
+        storage = _build_storage(raw_policy)
+        statedb = _open_state_db()
+        result = app_restore.rebuild_state(storage, statedb, _key_prefix(raw_policy))
+        print(f"State database rebuilt from remote: {result}")
+        return 0
+    except Exception:
+        LOG.error("rebuild-state command failed", exc_info=True)
+        return 1
+
+
+def _run_doctor_check(name, func, remediation):
+    try:
+        func()
+    except Exception:
+        LOG.error("doctor check failed: %s", name)
+        print(f"FAIL {name}: {remediation}")
+        return False
+    print(f"PASS {name}")
+    return True
+
+
+def _cmd_staging_status(_args):
+    """Operator-facing report on everything currently held in persistent
+    local staging -- see app.runner.build_staging_report. This is the
+    tool for spotting a repeat of the 2026-08-29 incident (174 GiB
+    accumulated in state/blob_cache/) early: a healthy system should show
+    a small, bounded figure here, not something scaling with the
+    protected backup set."""
+    try:
+        statedb = _open_state_db()
+        report = app_runner.build_staging_report(statedb.conn, STAGING_DIR, BLOB_CACHE_DIR)
+
+        print(f"Persistent staging: {_format_bytes(report['total_staging_bytes'])}")
+        if report["blob_cache_bytes"] > 0:
+            print(
+                f"WARNING: state/blob_cache/ is not empty "
+                f"({_format_bytes(report['blob_cache_bytes'])}) -- production code "
+                "should never write here anymore (see app.runner.Config's "
+                "docstring); investigate what created this."
+            )
+        print()
+
+        if not report["transactions"]:
+            print("No per-transaction staging.")
+        for txn in report["transactions"]:
+            flags = []
+            if txn["unknown_owner"]:
+                flags.append("UNKNOWN OWNER (no matching transaction)")
+            elif txn["stale"]:
+                flags.append("STALE (owning transaction is SUCCESS)")
+            flag_str = f"  [{', '.join(flags)}]" if flags else ""
+            print(f"{txn['txn_id']} (phase: {txn['phase'] or 'unknown'}){flag_str}")
+            for cat, size in sorted(txn["categories"].items(), key=lambda kv: -kv[1]):
+                print(f"    {cat:<12} {_format_bytes(size)}")
+
+        stale_total = sum(t["bytes"] for t in report["transactions"] if t["stale"])
+        unknown_total = sum(
+            t["categories"].get("unknown", 0) for t in report["transactions"]
+        )
+        print()
+        print(f"stale SUCCESS staging: {_format_bytes(stale_total)}")
+        print(f"unknown-category staging: {_format_bytes(unknown_total)}")
+
+        if report["oldest_txn_id"]:
+            age_days = (report["oldest_age_seconds"] or 0) / 86400
+            print(
+                f"Oldest staging artifact: {report['oldest_txn_id']} "
+                f"({age_days:.1f} days old)"
+            )
+        return 0
+    except Exception:
+        LOG.error("staging-status command failed", exc_info=True)
+        return 1
+
+
+def _cmd_staging_clean(args):
+    """Delete staging owned by SUCCESS transactions only -- never touches
+    a FAILED or nonterminal transaction's staging (that may still be
+    REQUIRED_FOR_RESUME, see Runner._upload's per-item cleanup) and never
+    touches "unknown owner" directories without a human looking at them
+    first (report via `staging-status`, decide by hand)."""
+    try:
+        statedb = _open_state_db()
+        report = app_runner.build_staging_report(statedb.conn, STAGING_DIR, BLOB_CACHE_DIR)
+
+        to_clean = [t for t in report["transactions"] if t["stale"]]
+        if not to_clean:
+            print("No stale SUCCESS staging to clean.")
+            return 0
+
+        total = sum(t["bytes"] for t in to_clean)
+        verb = "Cleaning" if args.apply else "Would clean"
+        plural = "y" if len(to_clean) == 1 else "ies"
+        print(
+            f"{verb} {len(to_clean)} stale SUCCESS staging director{plural} "
+            f"({_format_bytes(total)}):"
+        )
+        for t in to_clean:
+            print(f"  {t['txn_id']}  {_format_bytes(t['bytes'])}")
+
+        if not args.apply:
+            print()
+            print("Dry run only -- nothing deleted. Re-run with --apply to delete.")
+            return 0
+
+        ok = True
+        for t in to_clean:
+            txn_dir = STAGING_DIR / t["txn_id"]
+            try:
+                shutil.rmtree(txn_dir)
+                print(f"  deleted {txn_dir}")
+            except OSError as exc:
+                ok = False
+                print(f"  FAILED to delete {txn_dir}: {exc}")
+        return 0 if ok else 1
+    except Exception:
+        LOG.error("staging-clean command failed", exc_info=True)
+        return 1
+
+
+def _cmd_test_email(_args):
+    """Send a real test email without running a backup -- mandatory before
+    supervisor production enablement (see README/DEPLOY.md), since a
+    misconfigured SMTP setup should be caught by an operator running this
+    once, not discovered the first time a real transaction finishes."""
+    try:
+        client = app_notify_email.EmailClient()
+        result = client.test_email()
+        print(f"Email test: {result.status} (attempts: {result.attempts})")
+        if result.error:
+            print(f"  error: {result.error}")
+        if result.status == "disabled":
+            print(
+                "BACKUP_EMAIL_ENABLED is not set -- set it (and BACKUP_EMAIL_TO/"
+                "BACKUP_SMTP_*) in the environment or config/credentials.env."
+            )
+        return 0 if result.status == "sent" else 1
+    except Exception:
+        LOG.error("test-email command failed", exc_info=True)
+        return 1
+
+
+def _cmd_test_ntfy(_args):
+    """Publish a real test ntfy notification without running a backup --
+    the equivalent gate to `test-email`: an operator must confirm the
+    phone push actually arrives, not merely that the HTTP call returned
+    2xx (an ntfy publish can succeed while nobody is subscribed to the
+    topic -- see docs/DEPLOY.md)."""
+    try:
+        client = app_notify_ntfy.NtfyClient()
+        result = client.test_notification()
+        print(f"ntfy test: {result.status} (attempts: {result.attempts})")
+        if result.error:
+            print(f"  error: {result.error}")
+        if result.status == "disabled":
+            print(
+                "BACKUP_NTFY_ENABLED is not set -- set it (and BACKUP_NTFY_URL) in "
+                "the environment or config/credentials.env."
+            )
+        elif result.status == "sent":
+            print("HTTP publish succeeded -- confirm the push actually arrived on your phone.")
+        return 0 if result.status == "sent" else 1
+    except Exception:
+        LOG.error("test-ntfy command failed", exc_info=True)
+        return 1
+
+
+def _cmd_doctor(_args):
+    try:
+        raw_policy = _load_policy_yaml()
+    except Exception:
+        print(
+            f"FAIL configuration: unable to load {POLICY_PATH}. "
+            "Ensure the file exists and is valid YAML."
+        )
+        return 1
+
+    try:
+        raw_runtime = _load_runtime_yaml()
+    except Exception:
+        # Not a hard pre-check exit like policy.yaml above: most other
+        # checks below don't need runtime.yaml at all. Left as None so the
+        # runtime-config and next-run-time checks below fail explicitly
+        # and individually instead of aborting the whole doctor run.
+        raw_runtime = None
+
+    ok = True
+
+    def check_runtime_config_parses_and_validates():
+        _load_runtime_yaml()  # raises on missing/malformed config/runtime.yaml
+
+    ok &= _run_doctor_check(
+        "runtime config parses and validates",
+        check_runtime_config_parses_and_validates,
+        f"Runtime config is missing or invalid. Inspect {RUNTIME_PATH} and fix the "
+        "reported error -- see config/runtime.yaml's header comment for the expected shape.",
+    )
+
+    def check_source_mount_readable():
+        source = _source_root(raw_policy)
+        if not source.exists():
+            raise RuntimeError(f"source path does not exist: {source}")
+        if not os.access(source, os.R_OK | os.X_OK):
+            raise RuntimeError(f"source path is not readable/executable: {source}")
+
+    ok &= _run_doctor_check(
+        "source mount readable",
+        check_source_mount_readable,
+        "Source mount is not readable. Ensure the source filesystem is mounted and "
+        "permissions allow read/execute; run `mount | grep <source>` and `ls -ld <source>` "
+        "after replacing <source> with the configured source mount.",
+    )
+
+    def check_state_db_openable_and_migrated():
+        _open_state_db().close()
+
+    ok &= _run_doctor_check(
+        "state DB openable and migrated",
+        check_state_db_openable_and_migrated,
+        "State DB is not openable or not migrated. Verify the file exists and run "
+        "`backupctl rebuild-state` to repair the state database.",
+    )
+
+    def check_policy_file_parses_and_validates():
+        _load_policy()  # Policy.from_yaml raises on malformed/invalid config
+
+    ok &= _run_doctor_check(
+        "policy file parses and validates",
+        check_policy_file_parses_and_validates,
+        f"Policy file is invalid. Inspect {POLICY_PATH} and fix the reported error.",
+    )
+
+    def check_s3_credentials_present():
+        try:
+            _build_storage(raw_policy)
+        except MissingCredentials as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    ok &= _run_doctor_check(
+        "S3 credentials present",
+        check_s3_credentials_present,
+        "S3 credentials are not present. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
+        "in the environment; never print these values.",
+    )
+
+    def check_s3_authentication_and_bucket_visible():
+        storage = _build_storage(raw_policy)
+        try:
+            # bucket_accessible() is the purpose-built probe: one bounded
+            # list_objects_v2 for which truncation is a normal result. The
+            # ListPrefixLimitExceeded arm below is retained only so an
+            # older storage object without the method still behaves.
+            probe = getattr(storage, "bucket_accessible", None)
+            if probe is not None:
+                probe()
+                return
+            storage.list_prefix("", max_keys=1)
+        except ListPrefixLimitExceeded:
+            # list_prefix(prefix="", max_keys=1) against the whole bucket
+            # raises this the instant the bucket holds more than 1 object
+            # anywhere -- true for this bucket since the first real upload
+            # on 2026-08-19 (61,879+ objects under _osf_backup/). Reaching
+            # "IsTruncated" at all means list_objects_v2 already succeeded
+            # (real auth, real bucket visibility) and found more data than
+            # asked for -- that's proof of success for this check's actual
+            # purpose, not a failure. Found 2026-08-23: this check had been
+            # silently unable to ever pass since the bucket stopped being
+            # empty; a bare AccessDenied/NoSuchBucket/etc still fails below.
+            pass
+
+    ok &= _run_doctor_check(
+        "S3 authentication and bucket visible (real list_objects_v2 call)",
+        check_s3_authentication_and_bucket_visible,
+        "S3 authentication or bucket visibility failed. Verify AWS_ACCESS_KEY_ID / "
+        "AWS_SECRET_ACCESS_KEY are valid and the bucket in config/policy.yaml exists "
+        "and grants s3:ListBucket.",
+    )
+
+    def check_temp_local_space_available():
+        temp_dir = BACKUP_HOME / "tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        threshold = int(os.environ.get("MIN_FREE_BYTES", str(MIN_FREE_BYTES_DEFAULT)))
+        free = shutil.disk_usage(temp_dir).free
+        if free < threshold:
+            raise RuntimeError(f"free space {free} below threshold {threshold}")
+
+    ok &= _run_doctor_check(
+        "temporary local space available",
+        check_temp_local_space_available,
+        "Temporary local space is insufficient or MIN_FREE_BYTES is invalid. Set "
+        "MIN_FREE_BYTES to a valid integer and run `df -h <temp_dir>` to free enough space.",
+    )
+
+    def check_healthcheck_configuration():
+        # No-op when BACKUP_HEALTHCHECKS_URL is unset is documented,
+        # expected behaviour (see app/healthcheck.py) -- constructing the
+        # client must not raise either way; only a malformed URL is a
+        # real failure. Deliberately checks client.url, not
+        # os.environ.get(...) directly: the client itself falls back to
+        # config/credentials.env, and checking the environment alone (the
+        # bug here until 2026-09-08) would print this WARN even when the
+        # URL IS configured via the credentials file -- the exact
+        # dual-authority mistake this project's own conventions warn
+        # against (see app/wiring.py's module docstring).
+        client = app_healthcheck.HealthcheckClient()
+        # ...but "configured to do nothing" and "configured" must not read
+        # the same on an operator's screen. With no URL there is no
+        # dead-man switch at all: a daemon that dies silently, or a pod
+        # that never comes back up, produces no alert anywhere. That is a
+        # standing gap to state out loud on every doctor run, not a FAIL
+        # (the documented no-op contract is deliberate). Never send a
+        # ping here -- a success ping from doctor would falsify the real
+        # dead-man state (see docs/DEPLOY.md); use `backupctl status` for
+        # the last real ping result and a manually-triggered test check
+        # for connectivity, never doctor.
+        if not client.url:
+            print(
+                "  WARN: BACKUP_HEALTHCHECKS_URL is unset -- pings are no-ops and "
+                "NO dead-man monitoring exists. A silent daemon death will not "
+                "alert anyone."
+            )
+
+    ok &= _run_doctor_check(
+        "healthcheck configuration",
+        check_healthcheck_configuration,
+        "Healthcheck client construction failed. Check BACKUP_HEALTHCHECKS_URL "
+        "for a malformed value (unset is fine -- that's a documented no-op).",
+    )
+
+    def check_ntfy_configuration():
+        # Same shape as the Healthchecks check above, and the same
+        # deliberate omission: never publish a real notification from
+        # doctor (see docs/DEPLOY.md) -- use `backupctl test-ntfy` for an
+        # actual delivery test, which additionally requires a human to
+        # confirm the phone push arrived.
+        client = app_notify_ntfy.NtfyClient()
+        if not client.enabled:
+            print(
+                "  NOTE: BACKUP_NTFY_ENABLED is not set -- ntfy is disabled, "
+                "daily reports will not be pushed. Not a FAIL: ntfy is the "
+                "primary channel in production but nothing requires it."
+            )
+        elif client._misconfiguration():
+            raise RuntimeError(client._misconfiguration())
+
+    ok &= _run_doctor_check(
+        "ntfy configuration",
+        check_ntfy_configuration,
+        "ntfy is enabled but misconfigured. Check BACKUP_NTFY_URL in the "
+        "environment or config/credentials.env.",
+    )
+
+    # _lock_is_held is now module-level: the run/retry/abandon guard needs
+    # exactly the same authoritative liveness signal this check uses, and
+    # two copies of a liveness rule is how they drift apart.
+
+    def check_daemon_and_supervisor_status():
+        # This project runs bin/supervisor.sh directly (see DEPLOY.md /
+        # HANDOFF.md) rather than under supervisord or systemd -- neither
+        # binary is expected to exist here, and treating their absence as
+        # a FAIL (the previous behaviour) was a permanent false failure,
+        # not a real signal. The real liveness mechanism both processes
+        # actually use is a non-blocking flock, held for the process's
+        # whole lifetime: logs/supervisor.lock (bin/supervisor.sh) and
+        # state/backupd.lock (app/backupd.py, DEFAULT_LOCK_FILE).
+        supervisor_lock = BACKUP_HOME / "logs" / "supervisor.lock"
+        daemon_lock = BACKUP_HOME / "state" / "backupd.lock"
+
+        missing = []
+        if not _lock_is_held(supervisor_lock):
+            missing.append(f"supervisor not running ({supervisor_lock} is not locked)")
+        if not _lock_is_held(daemon_lock):
+            missing.append(f"daemon not running ({daemon_lock} is not locked)")
+
+        if missing:
+            raise RuntimeError("; ".join(missing))
+
+    ok &= _run_doctor_check(
+        "daemon and supervisor status",
+        check_daemon_and_supervisor_status,
+        "Supervisor or daemon is not running. Start it with "
+        "`nohup bin/supervisor.sh >> logs/supervisor.out 2>&1 &` (see DEPLOY.md) and verify "
+        "with `ps aux | grep supervisor.sh` / `ps aux | grep backupd.py`.",
+    )
+
+    def check_no_abandoned_transaction():
+        """A past day's transaction left mid-phase is a real, silent
+        condition: it can hold persistent staging and
+        uploaded-but-unreferenced blobs, and nothing in the system will
+        ever advance or clean it (see _abandoned_transactions). It does
+        not block tonight's backup, which is exactly why it needs saying
+        here -- it will otherwise sit unnoticed indefinitely.
+        """
+        today = datetime.now(MELBOURNE).date().isoformat()
+        abandoned = _abandoned_transactions(_read_transactions(STATE_DB_PATH), today)
+        if abandoned:
+            raise RuntimeError(
+                "; ".join(
+                    f"{t['txn_id']} stuck at {t['phase']} "
+                    f"(last updated {_age_phrase(t.get('updated_at'))})"
+                    for t in abandoned
+                )
+            )
+
+    ok &= _run_doctor_check(
+        "no abandoned in-progress transaction",
+        check_no_abandoned_transaction,
+        "A past day's transaction is stuck mid-phase and nothing will ever "
+        "advance it. Decide explicitly: `backupctl retry <date>` to finish it "
+        "(worthwhile past SCANNING, where uploads already exist), or leave it "
+        "as deliberate historical evidence -- but know it may hold staging and "
+        "unreferenced remote blobs. Run `backupctl status` / `staging-status` "
+        "for the detail.",
+    )
+
+    def check_last_successful_snapshot_age():
+        last = _last_success_run_date()
+        if not last:
+            raise RuntimeError("no successful snapshot")
+
+        last_dt = datetime.fromisoformat(last).replace(tzinfo=MELBOURNE)
+        max_age_hours = int(os.environ.get("MAX_SNAPSHOT_AGE_HOURS", "24"))
+        age = datetime.now(MELBOURNE) - last_dt
+        if age > timedelta(hours=max_age_hours):
+            raise RuntimeError(f"snapshot age {age} exceeds {max_age_hours} hours")
+
+    ok &= _run_doctor_check(
+        "last successful snapshot age",
+        check_last_successful_snapshot_age,
+        "Last successful snapshot is missing or older than MAX_SNAPSHOT_AGE_HOURS "
+        f"(default 24). Check `backupctl status` for the current transaction and "
+        "backupd's liveness -- this check reads app.runner.Runner's transactions "
+        "table, never the legacy StateDB `runs` table.",
+    )
+
+    def check_next_run_time():
+        if raw_runtime is None:
+            raise RuntimeError("runtime config could not be loaded")
+        next_run_dt = _next_melbourne_run(raw_runtime)
+        if next_run_dt < datetime.now(MELBOURNE):
+            raise RuntimeError("next run is in the past")
+
+    ok &= _run_doctor_check(
+        "next run time",
+        check_next_run_time,
+        "Next scheduled run computation is broken. Check config/runtime.yaml's "
+        "schedule.time value.",
+    )
+
+    def check_last_notification_status():
+        # Deliberately does not gate on "disabled" (a channel intentionally
+        # off) or None (older transaction predating these columns, or no
+        # transaction yet) -- see app/notify_ntfy.py/app/notify_email.py:
+        # neither channel may control backup truth, so this check reports
+        # the notification layer's own health, not the backup's. Covers
+        # both channels: ntfy is production's primary daily-report
+        # transport (2026-09-08), and a failed ntfy send after it was
+        # believed enabled is exactly the kind of silent gap doctor exists
+        # to catch.
+        transactions = _read_transactions(STATE_DB_PATH)
+        if not transactions:
+            return
+        latest = transactions[0]
+        problems = []
+        for label, status_key, error_key in (
+            ("ntfy", "ntfy_status", "ntfy_error"),
+            ("email", "notification_status", "notification_error"),
+        ):
+            status = latest.get(status_key)
+            if status in ("failed", "misconfigured"):
+                problems.append(f"{label}={status}: {latest.get(error_key)}")
+        if problems:
+            raise RuntimeError(f"{latest['txn_id']}: " + "; ".join(problems))
+
+    ok &= _run_doctor_check(
+        "last transaction's notifications",
+        check_last_notification_status,
+        "The most recent transaction's ntfy or email notification failed or is "
+        "misconfigured. Run `backupctl test-ntfy`/`test-email` and check "
+        "BACKUP_NTFY_*/BACKUP_EMAIL_*/BACKUP_SMTP_* in the environment or "
+        "config/credentials.env.",
+    )
+
+    def check_local_staging_computable():
+        # This check only verifies the report can be *built* -- the
+        # content is reported as WARN lines below, never FAIL, per
+        # Daniel's explicit "warnings, not hard limits" call (2026-08-29).
+        statedb = _open_state_db()
+        return app_runner.build_staging_report(statedb.conn, STAGING_DIR, BLOB_CACHE_DIR)
+
+    staging_report = None
+    try:
+        staging_report = check_local_staging_computable()
+        print("PASS local staging report computable")
+    except Exception:
+        LOG.error("doctor check failed: local staging report computable")
+        print(
+            "FAIL local staging report computable: could not read "
+            f"{STAGING_DIR}/{BLOB_CACHE_DIR}. Verify the paths exist and are readable."
+        )
+        ok = False
+
+    if staging_report is not None:
+        for line in _staging_warning_lines(staging_report):
+            print(f"WARN local staging: {line}")
+
+    return 0 if ok else 1
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="backupctl",
+        description="CLI for the selective backup system.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_status = subparsers.add_parser("status", help="Show backup status")
+    p_status.set_defaults(func=_cmd_status)
+
+    p_inventory = subparsers.add_parser(
+        "inventory", help="Classify source tree and write report without upload"
+    )
+    p_inventory.set_defaults(func=_cmd_inventory)
+
+    p_dry_run = subparsers.add_parser(
+        "dry-run", help="Classify, project upload, and write reports without upload"
+    )
+    p_dry_run.set_defaults(func=_cmd_dry_run)
+
+    p_run = subparsers.add_parser("run", help="Execute one logical run for today")
+    p_run.add_argument(
+        "--force-new-date",
+        action="store_true",
+        help=(
+            "Start today's transaction even if an older FAILED transaction "
+            "is still sitting unresolved. Without this flag, `run` refuses "
+            "and points at `retry <date>` instead -- see the guard's "
+            "docstring (_older_failed_transaction_date) for why."
+        ),
+    )
+    _add_allow_daemon_active(p_run)
+    p_run.set_defaults(func=_cmd_run)
+
+    p_retry = subparsers.add_parser("retry", help="Retry a specified FAILED date")
+    p_retry.add_argument("date", help="FAILED date in YYYY-MM-DD format")
+    _add_allow_daemon_active(p_retry)
+    p_retry.set_defaults(func=_cmd_retry)
+
+    p_abandon = subparsers.add_parser(
+        "abandon",
+        help="Close an interrupted transaction as deliberately ABANDONED (deletes nothing)",
+    )
+    p_abandon.add_argument("date", help="Transaction date in YYYY-MM-DD format")
+    p_abandon.add_argument(
+        "--reason",
+        required=True,
+        help="Why it is being abandoned -- recorded in the transaction row",
+    )
+    _add_allow_daemon_active(p_abandon)
+    p_abandon.set_defaults(func=_cmd_abandon)
+
+    p_report = subparsers.add_parser("report", help="Print the latest report")
+    p_report.set_defaults(func=_cmd_report)
+
+    p_snapshots = subparsers.add_parser(
+        "snapshots", help="List committed snapshots with dates and sizes"
+    )
+    p_snapshots.set_defaults(func=_cmd_snapshots)
+
+    p_verify = subparsers.add_parser(
+        "verify", help="Run sampled download verification"
+    )
+    p_verify.add_argument(
+        "--date",
+        default=None,
+        help="Snapshot date to verify (default: most recent)",
+    )
+    p_verify.set_defaults(func=_cmd_verify)
+
+    p_restore = subparsers.add_parser("restore", help="Restore a path from a snapshot")
+    p_restore.add_argument("--snapshot", required=True, help="Snapshot identifier")
+    p_restore.add_argument("--path", required=True, help="Path inside the snapshot")
+    p_restore.add_argument("--destination", required=True, help="Local destination")
+    p_restore.set_defaults(func=_cmd_restore)
+
+    p_rebuild = subparsers.add_parser(
+        "rebuild-state", help="Reconstruct state.sqlite from remote"
+    )
+    p_rebuild.set_defaults(func=_cmd_rebuild_state)
+
+    p_doctor = subparsers.add_parser("doctor", help="Exercise all critical dependencies")
+    p_doctor.set_defaults(func=_cmd_doctor)
+
+    p_test_email = subparsers.add_parser(
+        "test-email", help="Send a test email notification without running a backup"
+    )
+    p_test_email.set_defaults(func=_cmd_test_email)
+
+    p_test_ntfy = subparsers.add_parser(
+        "test-ntfy", help="Publish a test ntfy notification without running a backup"
+    )
+    p_test_ntfy.set_defaults(func=_cmd_test_ntfy)
+
+    p_staging_status = subparsers.add_parser(
+        "staging-status", help="Report local staging usage by transaction/category"
+    )
+    p_staging_status.set_defaults(func=_cmd_staging_status)
+
+    p_staging_clean = subparsers.add_parser(
+        "staging-clean", help="Remove staging owned by SUCCESS transactions"
+    )
+    p_staging_clean.add_argument(
+        "--apply", action="store_true", help="Actually delete (default: dry-run)"
+    )
+    p_staging_clean.set_defaults(func=_cmd_staging_clean)
+
+    return parser
+
+
+def main(argv=None):
+    logging.basicConfig(
+        level=os.environ.get("BACKUPCTL_LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

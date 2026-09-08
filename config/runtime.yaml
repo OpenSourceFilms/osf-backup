@@ -1,0 +1,21 @@
+# OSF Selective Backup — runtime/daemon scheduling configuration
+#
+# Deliberately separate from config/policy.yaml: this file controls WHEN and
+# HOW the daemon runs, not WHAT gets backed up. Policy.policy_hash hashes
+# only policy.yaml's data-selection/classification/retention semantics, so
+# changing the run time here must never invalidate an in-flight or
+# resumable transaction's policy-compatibility check (see
+# app/runner.py's _check_resumable_policy). Moved out of policy.yaml
+# 2026-08-29 after the 00:00 -> 04:00 schedule change was found to be
+# silently changing policy_hash despite not changing which files get
+# selected -- see HANDOFF.md for the change record.
+#
+# app/wiring.py's _load_runtime_yaml is the single shared loader; backupd,
+# backupctl status, and backupctl doctor all read schedule.time through it
+# so they can never silently disagree about when the nightly backup runs.
+
+schedule:
+  timezone: Australia/Melbourne
+  time: "04:00"
+  catch_up: true
+  resume_interrupted: true

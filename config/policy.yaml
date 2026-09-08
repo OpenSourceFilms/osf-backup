@@ -1,0 +1,511 @@
+# OSF Selective Backup — policy
+#
+# Path rules are LONGEST-PREFIX-WINS and are relative to source.root.
+# Precedence (highest first) is enforced in app/policy.py:
+#   hard exclusion > .backup-never > .backup-always > path rules
+#   > git classification > output budget > unclassified
+#
+# NOTE: the `paths:` arrays below are DERIVED FROM THE ACTUAL INVENTORY SCAN
+# (see reports/). They are not guesses. Anything not matched here falls through
+# to UNCLASSIFIED and is reported, never silently included or dropped.
+
+version: 1
+
+source:
+  root: /workspace
+
+target:
+  bucket: v6a4zjiytb
+  endpoint: https://s3api-eu-ro-1.runpod.io
+  region: EU-RO-1
+  prefix: _osf_backup
+  capacity_bytes: 300000000000   # 300 GB nominal (RunPod decimal GB; ~279.4 GiB
+                                  # actual). Resized 2026-08-19 from the original
+                                  # 100 GB per the corrected sizing audit -- see
+                                  # HANDOFF.md / the volume-sizing conversation.
+
+settling:
+  minimum_age_seconds: 600       # a file touched more recently is DEFERRED_ACTIVE
+
+storage:
+  warning_fraction: 0.70
+  discretionary_stop_fraction: 0.80
+  hard_stop_fraction: 0.90
+
+outputs:
+  # Capacity-control caps removed 2026-08-17 (Daniel): the backup volume must be
+  # sized FROM the measured natural protected set, not the other way around.
+  # max_file_bytes is kept as a review signal, not a capacity mechanism -- a
+  # rejection here means "flag this one exceptionally large item for the
+  # OVERSIZE REVIEW", not "trim to fit 100 GB".
+  max_file_bytes: 4294967296     # 4 GiB - oversize-review flag, not a budget
+  max_root_bytes: null           # was 12 GiB - removed as a capacity control
+  max_total_bytes: null          # was 25 GiB - removed as a capacity control
+  selection: newest_first
+
+retention:
+  daily: 14
+  weekly: 8
+  # Trimmed 6->4 on 2026-08-19 to match the 250 GB volume's modeled capacity.
+  # 6 monthly (~180d horizon) needed ~242 GiB at the Recommended tier (250 GB
+  # volume only has ~233 GiB); 4 monthly (~120d horizon) needs ~218 GiB,
+  # which fits with ~15 GiB margin -- thinner than the original 90-day
+  # estimate suggested, so re-check this once real snapshot history exists
+  # rather than treating it as permanently settled.
+  monthly: 4
+  unreferenced_blob_grace_days: 30
+
+verification:
+  daily_sample_max_bytes: 268435456    # 256 MiB
+  weekly_sample_max_bytes: 2147483648  # 2 GiB
+
+git:
+  mode: rescue_if_not_proven_remote
+  mutate_repositories: false
+  include_untracked_nonignored: true
+  uncertain_repo_action: full_backup
+
+markers:
+  always: .backup-always
+  never: .backup-never
+
+healthcheck:
+  # Value comes from env BACKUP_HEALTHCHECK_URL only. Never stored here —
+  # the Healthchecks secret lives in the URL path.
+  env_var: BACKUP_HEALTHCHECK_URL
+  timeout_seconds: 15
+
+paths:
+  # ----------------------------------------------------------------- CRITICAL
+  # Original work with no other authoritative copy. No per-file size cap.
+  # erf/ and pipeline/ code trees are also git repos (see git-aware handling
+  # below) - listed here as belt-and-braces for any repo that turns out
+  # RESCUE_REQUIRED, and to cover non-code project material that sits beside
+  # the repo (docs, decisions ledgers, configs).
+  critical:
+    - erf/README.md
+    - erf/MASTER.md
+    - erf/DECISIONS.md
+    - erf/GAMEPLAN.md
+    - erf/CLAUDE.md
+    - erf/BATON.md
+    - erf/bin
+    - erf/docs
+    - erf/people
+    - erf/enroll
+    - erf/pyproject.toml
+    - erf/requirements.lock
+    - CLAUDE.md
+    - AUDIT.md
+    - PHASE_0_STATUS.md
+    - PHASE_1_STATUS.md
+    - LifeR_HybridSceneEdit_SETUP
+    - LifeR_Pitch_Deck.pdf
+    - LifeR_15.pdf
+    - LifeR_16.pdf
+    - POC_VFX/facemasks
+    - POC_VFX/comfy_graphs
+    - comfy/opensourcefilms-comfyui-workflows
+    - comfy/_tools
+    - comfy/workflows
+    - melb_acquire/ABN_bulk
+    - melb_acquire/output
+    - melbourne_all_found_resources
+    - OrbitTurn_Reskin_Workflows_2026-08-06
+    - Meadows_Share
+    - bin
+    # ---- added 2026-08-17 (Daniel priority pass) ----
+    # workflows/config/authored scripts -> backup: per-comfy-install `user/`
+    # holds each install's user/default/workflows (authored graphs) + manager
+    # config, not runtime/model payload.
+    - comfy/ComfyGeneral/user
+    - comfy/ComfyUI_LTX23/user
+    - comfy/ComfyUI_WANVACE/user
+    - comfy/ComfyUI_SCAIL2/user
+    - comfy/ComfyUI_VideoMaMa/user
+    - table_read/Roles
+    # ---- added 2026-08-23 (policy-conformance audit) ----
+    # table_read/braw_decode (124 MiB): mixed authored source (braw_decode.cpp,
+    # run_batch.sh, render_clip.sh) + QA comparison stills (qa_stills/*.png,
+    # braw vs h264 vs h265) + rebuildable .o/binary + logs. Was UNCLASSIFIED
+    # (a prior "keep the whole directory" decision existed only in BATON.md,
+    # never encoded here -- same pattern as the erf/media bug). Kept whole
+    # rather than split at file level, per the original sizing-conversation
+    # call; trivial size either way.
+    - table_read/braw_decode
+    # ---- added 2026-09-07 (unprotected-tree adjudication, Daniel's blanket
+    # go-ahead after the gap was measured and put to him) ----
+    # Every entry below was verified UNCLASSIFIED/selected=False against the
+    # live policy, is NOT a git repo, and had no rule at any depth -- i.e.
+    # none of it had ever been backed up. Where a tree mixes authored
+    # material with generated bulk, the tree root is CRITICAL and the bulk
+    # subdirectory is demoted explicitly below (longest-prefix-wins), which
+    # is the same shape as the existing comfy/ and erf/ entries.
+    #
+    # melb_acquire: subdirectories were already ruled (ABN_bulk/output
+    # critical, data/_archive/api/... outputs, logs redownloadable) but
+    # NOTHING covered files at the tree root -- which is exactly where its
+    # BATON.md, DECISIONS.md and audit reports live. Root rule added; the
+    # existing deeper rules keep winning on their own prefixes, and the
+    # caches/venv are demoted under redownloadable below.
+    - melb_acquire
+    # ASIC_bulk (0.59 GiB, 4 files): bulk government dataset, same class as
+    # melb_acquire/ABN_bulk which was already ruled CRITICAL. Classified the
+    # same way for consistency rather than guessing it re-downloadable.
+    - melb_acquire/ASIC_bulk
+    # sparkvsr-pulse-lab: G4_G5_TECHNICAL_RECORD.md + scripts/ (30 authored
+    # files) + manifests/. runs/ (3.16 GiB of experiment output) is OUTPUTS.
+    - sparkvsr-pulse-lab
+    # sparkvsr-prod: MODIFICATIONS.md, supir_v0f_template_workflow.json and
+    # supir_presets/ -- authored ComfyUI/SUPIR configuration, 22 KiB total.
+    - sparkvsr-prod
+    # three_ghosts: BATON.md, FINDINGS_2026-09-07.md, S03_FROZEN.md and its
+    # .sha256, plus calibration/. media/ (the three frozen .mp4s the sha256
+    # covers) is OUTPUTS.
+    - three_ghosts
+    # _incident_2026-09-04: a deliberate evidence snapshot (SHA256SUMS.txt
+    # plus the captured configs/scripts/log at the time of the incident).
+    # Evidence is worthless if it is not the bytes that were captured, so it
+    # is kept whole -- including the 80 MiB copyparty.log.snapshot.
+    - _incident_2026-09-04
+    # github/: every subdirectory except runpod_renewal is a git repo with a
+    # GitHub remote, and git-aware classification already handles those
+    # correctly (path rules OUTRANK git classification, so a blanket
+    # `github` rule would force full-repo backups of 14 already-remote
+    # mirrors). Only the genuinely unprotected loose material is listed.
+    - github/BATON.md
+    - github/CLAUDE.md
+    - github/LICENSING_RESEARCH_BRIEF_2026-07-22.md
+    - github/licensing.txt
+    - github/.claude
+    - github/runpod_renewal
+    # table_read/Media (18 GiB, single file): 3018_10171415_C001.braw.PARTIAL
+    # -- an incomplete/recovery-pending BRAW recording. No complete .braw
+    # replacement found anywhere on /workspace, and no H.264 proxy exists for
+    # C001 in Media_H264 (only C002-C005 do). This is the only local copy of
+    # C001 in any form. Was UNCLASSIFIED (not backed up at all). No per-file
+    # cap needed -- critical is exempt from the outputs budget, appropriate
+    # for a 19.26 GiB irreplaceable partial recording.
+    - table_read/Media
+    # table_read/Media_H264 (5.0 GiB, 4 files, C002-C005): no raw .braw
+    # counterpart found on /workspace for any of these four rolls -- these
+    # H.264 files appear to be the only local copies of that footage, not
+    # disposable proxies of a retained original. Was UNCLASSIFIED.
+    - table_read/Media_H264
+    - .mempalace_src
+    - services/copyparty
+    # _BACKUP curating itself: static app/bin/config/docs/rebuild material ->
+    # backup. Live state/log/tmp/.venv/_inventory/_gen/locks already handled
+    # by hard_exclude below (never ordinary-backed-up; state DB is handled
+    # through backupctl's own snapshot/retention mechanism, not raw copy).
+    # credentials.env stays protected via hard_exclude precedence even though
+    # it lives inside _BACKUP/config, which is listed here.
+    - _BACKUP/bin
+    - _BACKUP/app
+    - _BACKUP/config
+    - _BACKUP/docs
+    # Top-level catalog/ (~0.3 GiB) -- Daniel's ruling 2026-08-19: trivial
+    # size at the chosen backup capacity, and reconstructability depends on
+    # pipeline/'s raw inputs surviving, which is not confirmed. No benefit
+    # to risking data loss to save ~300 MB. catalog/logs, catalog/status,
+    # catalog/milvus stay REDOWNLOADABLE below (longest-prefix-wins) -- those
+    # are derived-only (logs/status/vector index), unlike the rest of the tree.
+    - catalog
+    # /workspace/.claude/ -- Daniel's ruling 2026-08-19: keep only explicitly
+    # authored operational material (CLAUDE.md, settings/config, hooks,
+    # locally authored scripts). .claude/projects and .claude/file-history
+    # (session/project history) are excluded below, matching the existing
+    # .claude/cache, .claude/telemetry etc. sibling entries. Everything else
+    # under /workspace/.claude/ (commands, daemon, jobs, plans, session-env,
+    # sessions, tasks, backups, and the various top-level logs/state files)
+    # is deliberately left unclassified -- not named in Daniel's ruling, and
+    # guessing here would be the same mistake the audit already flagged for
+    # top-level catalog/ before he ruled on it.
+    - .claude/CLAUDE.md
+    - .claude/settings.json
+    - .claude/settings.local.json
+
+  # ---------------------------------------------------------------------- BTS
+  # Behind-the-scenes footage. Included. Exempt from output file caps.
+  # Confirmed 31.6 GB / 1,104 files. Note: this tree DOES contain at least one
+  # RED-camera-named file (fight_test_19.6.26/Noah_BTS/A001_02051406_C026.mov)
+  # sitting alongside phone footage (PXL_/IMG_ prefixes) - proof this class
+  # cannot be told apart from `principal` by extension, only by path.
+  bts:
+    - BTS
+
+  # ---------------------------------------------------------------- PRINCIPAL
+  # Camera-original / principal photography. EXCLUDED by explicit path only —
+  # never by extension, because BTS shares the same containers (.mov/.mp4).
+  principal:
+    - footage/DAY_1/RUSHES
+    - footage/DAY_2/RUSHES
+    - footage/DAY_3/RUSHES
+    - footage/DJI
+    - footage/360
+    - footage/RED_OTHER
+    - footage/HDRI            # not camera-original but large derived/sourced
+                               # HDR reference assets; excluded pending review
+    - media/originals          # post-production originals staging, not project source
+    - POC_VFX/Shots/*/plate    # camera-original plates copied into VFX shot trees
+    - POC_VFX/Shots/*/Plate    # same, capitalized variant (sword_test, turn_to_door,
+                               # light_sconces, drop_masks all use "Plate" not "plate")
+    - POC_VFX/Shots/drop_masks/Workplates          # differently-named plate variant, same reason
+    - POC_VFX/Shots/drop_into_frame/C003_C002_0924EJ.mov  # RED-matched transcode with no
+                               # "plate"-named parent dir to catch it by pattern
+
+  # ----------------------------------------------------------- REDOWNLOADABLE
+  # Payload excluded; a reconstruction manifest is still recorded.
+  redownloadable:
+    - .cache
+    - .pod-persist/huggingface-cache
+    - .pod-persist/npm-global
+    - .pod-persist/node-lib
+    - .pod-persist/duckdb-home
+    - .pod-persist/chroma-cache
+    - .pod-persist/comfy-env
+    - .pod-persist/uv-python
+    - venvs
+    - weights
+    - external_models
+    - comfy/models_shared
+    - comfy/_downloads
+    - comfy/ComfyUI_WANVACE/models
+    - comfy/ComfyUI_SCAIL2/models
+    - comfy/ComfyGeneral/models
+    - comfy/ComfyUI_LTX23/models
+    - comfy/ComfyUI_VideoMaMa/models
+    - erf/venvs
+    - erf/weights
+    - motiongen_tests/caches
+    - motiongen_tests/repos
+    - motiongen_tests/checkpoints
+    - motiongen_tests/models_smplx_v1_1.zip
+    - motiongen_tests/envs
+    # was ALSO listed under critical: above ("exclude .vdb below despite
+    # this") on the assumption .hip/.hipnc authored scenes might live here
+    # too -- that critical entry silently won this rule (identical prefix,
+    # critical parsed first, matcher tie-break is first-rule-wins on equal
+    # length), so this redownloadable entry was dead from the day it was
+    # written. Audited 2026-08-23: the entire tree is 2 files, both
+    # Flame*.zip VDB cache archives, no .hip/.hipnc present. Removed the
+    # critical entry above rather than reordering -- there is currently
+    # nothing authored here to protect. Live-verified via Policy.classify().
+    - POC_VFX/GeneralAssets/houdini_caches  # .vdb simulation caches - regenerable
+    - POC_VFX/GeneralAssets/RoomScan/OLD    # 4.7 GB stale zip, superseded
+    - archive/catalog_20260202T132929Z      # reconstructible proxy/keyframe archive
+    - rtfm_db_backup_20260713               # rebuildable search index
+    - pipeline                              # legacy per CLAUDE.md; superseded by erf/
+    - node_modules
+    # NOTE: the three "**/..." glob-style entries formerly here never matched
+    # anything -- policy.py's path-rule engine is longest-prefix-wins on
+    # literal path components only, no wildcard support. `.venv`/`venv` are
+    # still safely caught scan-wide by scanner.py's DEFAULT_REDOWNLOADABLE_DIR_NAMES
+    # (directory-name pruning, independent of these path rules); `__pycache__`
+    # and `node_modules` were NOT in that scanner set and were leaking into
+    # UNCLASSIFIED everywhere -- fixed 2026-08-17 by adding both names to
+    # DEFAULT_REDOWNLOADABLE_DIR_NAMES in app/scanner.py instead of relying on
+    # a non-functional glob here.
+    # ---- added 2026-08-17 (Daniel priority pass) ----
+    - comfy/ComfyGeneral/bin
+    - comfy/ComfyGeneral/include
+    - comfy/ComfyGeneral/lib
+    - comfy/ComfyGeneral/lib64
+    - comfy/ComfyGeneral/share
+    - comfy/.venv_submit
+    - erf/vendor                            # gitignored vendor/{VibeVoice,DiariZen} - 586 MB, reconstructable
+    - erf/tmp
+    - erf/.rtfm_backups                     # rebuildable search index, same as rtfm_db_backup_20260713 above
+    - table_read/_braw_toolchain            # Blackmagic BRAW SDK, not authored - 363 MB
+    - quarantine                            # legacy, dated 20260204, superseded - ~90 MB
+    - services/neo4j                        # derived graph index, reconstructable from canonical artifacts
+    - catalog/logs
+    - catalog/status
+    - catalog/milvus                        # derived vector index, reconstructable
+    - melb_acquire/logs
+    - deepseek_agent/logs
+    - .claude/plugins                       # reinstallable plugin code, 307 MB
+    - .claude/cache
+    - .claude/shell-snapshots
+    - .claude/telemetry
+    - .claude/paste-cache
+    - .claude/projects                      # session history -- Daniel's ruling 2026-08-19
+    - .claude/file-history                  # per-session undo/edit history -- same ruling
+    # ---- added 2026-08-23 (classification-audit ruling never encoded until now) ----
+    # erf/media/{keyframes,proxies,thumbs} are pipeline-regenerable derived media
+    # (~4.68 GiB combined: proxies 3.9G, keyframes 685M, thumbs 309M) -- the
+    # adjudication existed only in conversation, never in this file, so the broad
+    # `outputs: - erf/media` rule below over-protected them. Longest-prefix-wins
+    # (app/policy.py _match_path_rule) means these three overrides apply only to
+    # files under these exact subtrees; erf/media/music_risk_review (~91 MiB) and
+    # anything else directly under erf/media still fall through to the OUTPUTS rule
+    # below and stay protected. See HANDOFF.md 2026-08-23 checkpoint.
+    - erf/media/keyframes
+    - erf/media/proxies
+    - erf/media/thumbs
+    # platelock/env/platewarp/{bin,lib,lib64,include,share} is a conventional
+    # `python3.12 -m venv` (pyvenv.cfg confirmed, no non-venv files present) -
+    # 8.6 GiB, was falling through to the broad `outputs: - platelock` rule
+    # below with no override. Longest-prefix-wins: this 2-segment rule beats
+    # the 1-segment `platelock` OUTPUTS rule for this subtree only; the rest
+    # of platelock/ (authored code/data) stays OUTPUTS/selected.
+    - platelock/env
+    # Three near-duplicate WordPress backups sitting under website/ (a dump, a
+    # WeTransfer export, and a recovery copy of the same site) -- ~44,000 tiny
+    # PHP/JS/CSS files, ~1.66 GiB, that were dominating the tail of the
+    # 2026-08-23 seed's upload phase on per-file round-trip latency alone.
+    # Daniel's call, 2026-08-23: exclude as redundant. The rest of website/
+    # (index.html, Docs, the .sql dump, code-handoff-inventory, etc.) stays
+    # OUTPUTS/selected -- these four prefixes only.
+    - website/DL_Dump
+    - website/wetransfer_u797478838_xubk0-3-sql_2025-11-25_2206
+    - website/recovery
+    - website/recovery-backups
+    # Sibling zip of the DL_Dump/ tree above, not caught by that prefix rule
+    # (component-boundary matching: "DL_Dump.zip" != "DL_Dump"). Confirmed via
+    # `unzip -l` 2026-08-27: 19,591 entries, identical wp-admin/wp-content/
+    # wp-includes layout plus a second copy of the same .sql export -- a
+    # reproducible archive of the already-excluded dump, not unique material.
+    # Was still OUTPUTS/selected=True (~455.5 MiB) as of backup-2026-08-23;
+    # this only affects future scans, that committed snapshot is untouched.
+    - website/DL_Dump.zip
+    # ---- added 2026-09-07 (demotions paired with the new CRITICAL tree
+    # roots above -- longest-prefix-wins, so these carve the rebuildable
+    # bulk back out of trees whose roots are now protected) ----
+    # melb_acquire's tooling caches and its 1.08 GiB conventional venv.
+    # Same reasoning as platelock/env and erf/venvs: reconstructible from
+    # the lockfile, nothing authored inside.
+    - melb_acquire/.venv
+    - melb_acquire/__pycache__
+    - melb_acquire/.pytest_cache
+    - melb_acquire/.rtfm
+    - melb_acquire/.rtk
+    - melb_acquire/.duckdb_tmp
+    # github/.rtfm (37 MiB): an RTFM search index, rebuilt by reindexing.
+    - github/.rtfm
+    # sparkvsr-prod's empty model/cache scratch dirs -- listed so they stay
+    # excluded if they ever fill with downloaded SUPIR weights.
+    - sparkvsr-prod/models
+    - sparkvsr-prod/cache
+
+  # ------------------------------------------------------------------ OUTPUTS
+  # Generated results, retained within the quotas in the `outputs:` section
+  # above. Everything NOT listed under critical/bts/principal/redownloadable
+  # in these large working trees falls through here rather than to
+  # unclassified, since it is recognisably generated project output.
+  outputs:
+    - erf/media
+    - erf/catalog
+    - erf/checkpoints
+    - erf/renders
+    - erf/index
+    - erf/logs.all
+    - motiongen_tests/outputs
+    - melb_acquire/data
+    - melb_acquire/_archive
+
+    # Longest-prefix-wins overrides: these live inside a plate/Plate-named
+    # directory (see principal: above) but are NOT RED-camera transcodes —
+    # confirmed no matching clip in footage/DAY_N/RUSHES during this session's
+    # audit. Keeping them out of the broader plate/ exclusion.
+    # (folder-level overrides don't work here: "longest prefix wins" is a
+    # strict length comparison with no literal-over-wildcard tiebreak, and
+    # POC_VFX/Shots/<shot>/plate is exactly as long as the wildcard rule
+    # above it — so these must be listed file-by-file to win the tie.)
+    - POC_VFX/Shots/orbit_and_turn/plate/Orbit_and_turn_Lastframe_Flames_1088p_02.png
+    - POC_VFX/Shots/orbit_and_turn/plate/Orbit_and_turn_Middleframe_Flames_1088p_02.png
+    - POC_VFX/Shots/orbit_and_turn/plate/Orbit_and_turn_Firstframe_Flames_1088p_01.png
+    - POC_VFX/Shots/orbit_and_turn/plate/orbit_and_turn_4K8Bit_01.mov
+    - POC_VFX/Shots/orbit_and_turn/plate/orbit_and_turn_01_1080p_8bit_h264.mp4
+    - POC_VFX/Shots/orbit_and_turn/plate/orbit_and_turn_5K8Bit_01.mp4
+    - POC_VFX/Shots/orbit_and_turn/plate/orbit_and_turn_4K8Bit_01.mp4
+    - POC_VFX/Shots/orbit_and_turn/plate/orbit_and_turn_01.mov
+    - POC_VFX/Shots/sword_test/Plate/swordtest_01.mov
+    - POC_VFX/Shots/light_sconces/Plate/Chapel_fire&sconces.mov
+    - POC_VFX/Shots/light_sconces/Plate/plate with fire.mov
+    - melb_acquire/datashare_orders_2026_04_03
+    - melb_acquire/victorian_liquor_licences_monthly_2024_11_to_2025_10
+    - melb_acquire/commercialrealestate
+    - POC_VFX/Shots            # everything except plate/ (principal, excluded
+                                # above) and houdini_caches (redownloadable)
+    - POC_VFX/GeneralAssets    # minus houdini_caches, RoomScan/OLD (see above)
+    - POC_VFX/uploads
+    - media/proxies
+    - media/keyframes
+    - archive/runstate_20260202T135349Z
+    - bikematch
+    - platelock
+    - plate_reg_lab
+    - website
+    - webroot
+    - exports                  # currently empty; kept for when it isn't
+    # ---- added 2026-08-17 (Daniel priority pass) ----
+    # inputs -> backup unless demonstrably duplicated/reconstructable (treated
+    # as not-yet-demonstrated, so backed up); useful outputs -> backup.
+    # custom_nodes deliberately NOT listed here -- routed through git-aware
+    # classification instead (see git-aware wiring note in DECISIONS/report).
+    - comfy/ComfyGeneral/input
+    - comfy/ComfyGeneral/output
+    - comfy/ComfyUI_LTX23/input
+    - comfy/ComfyUI_LTX23/output
+    - comfy/ComfyUI_WANVACE/input
+    - comfy/ComfyUI_WANVACE/output
+    - comfy/ComfyUI_SCAIL2/input
+    - comfy/ComfyUI_SCAIL2/output
+    - comfy/ComfyUI_VideoMaMa/input
+    - comfy/ComfyUI_VideoMaMa/output
+    - melb_acquire/audit_bundle
+    - melb_acquire/verification
+    - melb_acquire/api
+    # ---- added 2026-09-07 (paired with the new CRITICAL tree roots) ----
+    # Generated experiment output under an otherwise-authored tree: 1,306
+    # files / 3.16 GiB of pulse-lab run artifacts. Protected, but
+    # discretionary -- capacity-skippable, unlike its scripts/ and record.
+    - sparkvsr-pulse-lab/runs
+    # The three frozen .mp4 deliverables S03_FROZEN.sha256 attests to.
+    - three_ghosts/media
+    - sparkvsr-prod/output
+    # Top-level /workspace/logs: live service logs (copyparty, cloudflared,
+    # dramatiq). Not authored, but the only record of service behaviour
+    # during an incident -- worth keeping, worth being capacity-skippable.
+    - logs
+
+  # ---------------------------------------------------------- SQLITE DATABASES
+  # Copied via SQLite's backup API, never byte-for-byte off a live file.
+  # Listed by explicit path — not every .db file is SQLite.
+  # erf's 4 live, actively-written (WAL mode) databases confirmed 2026-08-19
+  # per Daniel's ruling: "protect it, but enforce SQLite-safe backup for live
+  # DB files regardless of Git classification." Runner._backup_sqlite routes
+  # these through sqlite3's own .backup() online-backup API (see runner.py),
+  # not a raw filesystem copy -- these are also excluded from git_rescue's
+  # per-file walk of erf/ so they're never double-handled (raw copy + proper
+  # backup of the same file).
+  # archive/catalog_20260202T132929Z/catalog_full/*.db and catalog/*.db were
+  # seen during inventory but not verified as live/in-use (vs. static/archived
+  # copies, which need no live-snapshot handling) -- left out, still open.
+  sqlite_databases:
+    - erf/state/erf.db
+    - erf/state/erf_fts.db
+    - erf/state/journal.db
+    - erf/state/narrative_pipeline.db
+
+# Hard exclusions applied before every other rule. These protect the backup
+# system's own secrets/state and known credential stores.
+hard_exclude:
+  - _BACKUP/config/credentials.env
+  # Not part of Daniel's 2026-08-19 .claude/ ruling explicitly -- added by
+  # inference from the existing precedent immediately above (a live
+  # credential store, same class as credentials.env). Flag for Daniel:
+  # confirm or override.
+  - .claude/.credentials.json
+  - _BACKUP/state
+  - _BACKUP/logs
+  - _BACKUP/tmp
+  - _BACKUP/.venv
+  - _BACKUP/_inventory
+  - _BACKUP/_gen
+  - _secrets
+  - secrets
+  - .pod-persist/secrets
+  - .cloudflared
+  - .erf.env

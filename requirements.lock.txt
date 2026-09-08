@@ -1,0 +1,14 @@
+boto3==1.43.72
+botocore==1.43.72
+iniconfig==2.3.0
+jmespath==1.1.0
+packaging==26.3
+pluggy==1.6.0
+pygments==2.20.0
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+pyyaml==6.0.3
+s3transfer==0.19.2
+six==1.17.0
+urllib3==2.7.0
+zstandard==0.25.0

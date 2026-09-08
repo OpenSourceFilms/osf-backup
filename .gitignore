@@ -1,0 +1,25 @@
+# Secrets -- never commit
+config/credentials.env
+.mcp.json
+
+# Runtime state / operational data (see README "Layout": these are
+# explicitly never backed up, and likewise don't belong in the repo)
+state/
+logs/
+tmp/
+_gen/
+_audit_*/
+_inventory/
+reports/
+audits/
+
+# Local scratch / caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.rtfm/
+
+# Local Claude Code state (host-specific)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
