@@ -1,0 +1,23 @@
+This directory (deployed as /workspace/_BACKUP) is LIVE PRODUCTION INFRASTRUCTURE:
+the selective backup daemon (backupd + supervisor.sh) that protects most of
+/workspace against data loss, running nightly at 04:00 Australia/Melbourne.
+
+On 2026-09-11 this entire tree was deleted by a disk-cleanup session that
+mistook it for a stale backup archive because of its name. The running
+processes survived on borrowed memory; the code was recoverable from
+github.com/OpenSourceFilms/osf-backup, but local state/logs/credentials were
+not, and had to be reconstructed from the remote S3 catalog and manifests.
+See /workspace/_BACKUP_RECOVERY_20260911/ for the full incident record.
+
+Before deleting, moving, or bulk-cleaning ANYTHING under this path:
+  - This is not a backup OF something else. This IS the backup system itself.
+  - Its credentials live OUTSIDE this tree now, at
+    /workspace/.pod-persist/secrets/osf-backup.env (config/credentials.env
+    is a symlink to that file) -- specifically so deleting this tree again
+    cannot also destroy the only copy of production credentials.
+  - Its code has a GitHub remote (github.com/OpenSourceFilms/osf-backup), but
+    state/logs/credentials do not and are NOT trivially recoverable.
+
+If this system genuinely needs to be retired, that is Daniel's call to make
+explicitly -- not something to infer from an unfamiliar directory name during
+a routine cleanup pass.

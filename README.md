@@ -159,6 +159,20 @@ not 04:00 — see `HANDOFF.md` for the change record. Retention's
 daily/weekly/monthly rollover boundaries (`app/util.py`'s `next_midnight`)
 are a separate, unrelated calendar-day concept and are unaffected.
 
+## Credentials location (changed 2026-09-11)
+
+`config/credentials.env` is a **symlink** to
+`/workspace/.pod-persist/secrets/osf-backup.env`, not a real file in this
+tree. This is deliberate, post-incident: on 2026-09-11 this entire directory
+was accidentally deleted while `backupd` was live, and the only copy of
+production credentials (which lived here as a real file) was lost with it —
+recoverable only because the AWS keys could be re-issued and the ntfy/
+Healthchecks URLs were still known. Keeping the real file outside this tree
+means deleting `_BACKUP` again cannot also delete its own credentials. Every
+reader in this codebase (`app/storage.py`, `app/notify_ntfy.py`,
+`app/healthcheck.py`, `app/notify_email.py`) opens `config/credentials.env`
+by path and follows the symlink transparently — no code change was needed.
+
 ## Notifications
 
 Three independent channels, deliberately isolated from each other and from

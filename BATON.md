@@ -21,6 +21,33 @@ Daniel gave GO for a completely fresh seed instead. **Read `HANDOFF.md` checkpoi
 truth.
 
 ## NOW
+**INCIDENT RECOVERY 2026-09-11 — candidate built, not yet cut over.** A root-level
+disk-cleanup session deleted `/workspace/_BACKUP` entirely (mistook it for a stale
+backup archive from its name), while `backupd`/`supervisor.sh` were live and running.
+Code recovered from `github.com/OpenSourceFilms/osf-backup` (HEAD `a0d9400`, matches
+what was running — verified via a byte-identical recovered `bin/supervisor.sh` from
+the still-open deleted fd). Local state/logs/credentials were not git-tracked and had
+to be reconstructed from remote S3: `backup-2026-09-10`'s catalog (downloaded,
+integrity-checked, cross-validated three ways — manifest diff, prior-catalog diff,
+independent `rebuild-state` replay, all zero discrepancies) is the recovered
+production state, reconciled to `phase=SUCCESS` on log + source-read evidence (not
+guessed). Full forensic record: `/workspace/_BACKUP_RECOVERY_20260911/`.
+
+**Two durable changes made as part of recovery, both Daniel-approved:**
+- `config/credentials.env` is now a symlink to `/workspace/.pod-persist/secrets/osf-backup.env`
+  (outside this tree) so deleting `_BACKUP` again can't also destroy the only credential copy.
+- `capacity_bytes` raised 300GB -> 350GB (RunPod volume `v6a4zjiytb` physically resized
+  first, API-verified before the config edit) after `backup-2026-09-11` hit `CapacityError`
+  with canonical referenced bytes (275.36GB) already over the old 270GB hard threshold.
+  Fractions unchanged (0.80/0.90); no retention/GC pruning was used to solve this.
+
+**Open follow-up, deliberately not touched during recovery:** whether the capacity
+ledger only counts canonical committed blobs (missing the current transaction's own
+new uploads until COMMITTING) — if so the hard-stop check can be overshot by a whole
+transaction's new unique payload, which would explain 09-10 finishing at 275.36GB
+against a 270GB hard threshold. Needs a real test, not a guess, after production is
+stable again.
+
 **CANARY PHASE CLOSED, 2026-08-29T01:33 Melbourne.** `backup-2026-08-23` (old unbatched impl),
 `backup-2026-08-27` and `backup-2026-08-28` (real `backupd`-driven, new batching) all reached genuine
 SUCCESS, independently verified — full checklist and evidence in memory

@@ -19,8 +19,17 @@ target:
   endpoint: https://s3api-eu-ro-1.runpod.io
   region: EU-RO-1
   prefix: _osf_backup
-  capacity_bytes: 300000000000   # 300 GB nominal (RunPod decimal GB; ~279.4 GiB
-                                  # actual). Resized 2026-08-19 from the original
+  capacity_bytes: 350000000000   # 350 GB nominal (RunPod decimal GB; ~325.96 GiB
+                                  # actual). Resized 2026-09-11 from 300 GB after
+                                  # the 2026-09-11 _BACKUP deletion incident: the
+                                  # 09-11 run hit CapacityError with 275.36 GB
+                                  # canonical referenced bytes already over the
+                                  # old 270 GB hard threshold. Physical RunPod
+                                  # network volume v6a4zjiytb confirmed resized to
+                                  # 350 GB (API-verified) before this edit was
+                                  # made -- see recovery notes under
+                                  # /workspace/_BACKUP_RECOVERY_20260911/. Prior
+                                  # history: resized 2026-08-19 from the original
                                   # 100 GB per the corrected sizing audit -- see
                                   # HANDOFF.md / the volume-sizing conversation.
 
