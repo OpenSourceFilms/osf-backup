@@ -1,5 +1,17 @@
 # OSF Selective Backup
 
+> **Historical implementation, not a current deployment guide (October 2026).**
+> This repository documents OSF's earlier RunPod S3-compatible, selective
+> content-addressed backup design. It is retained for its reusable engineering
+> ideas, including conservative file classification, crash-resumable manifests,
+> recovery independent of local caches, and explicit storage-capacity admission.
+> The pod identities, volume paths, credentials workflow, capacities and startup
+> instructions below describe that historical environment. They are **not
+> verified for any present OSF installation** and should not be applied to a
+> live pod without independent configuration, rights review, recovery testing
+> and confirmation of the deployment target. No actual backup data or
+> credentials are provided here.
+
 A selective, deduplicating, resumable backup service for the `/workspace`
 network volume, writing to the RunPod network volume `v6a4zjiytb` over its
 S3-compatible API.
@@ -7,7 +19,7 @@ S3-compatible API.
 **Install root:** `/workspace/_BACKUP` (on the shared network volume, so it
 survives pod rebuilds and is reachable from every pod that mounts it).
 
-**Runs on:** the always-on CPU-only pod. It was *built* from the GPU pod —
+**Original intended runtime:** an always-on CPU-only pod. It was *built* from the GPU pod —
 both mount the same `/workspace`, but the CPU pod's startup mechanism was not
 inspectable from the build session. See `docs/DEPLOY.md` before enabling
 autostart there.
