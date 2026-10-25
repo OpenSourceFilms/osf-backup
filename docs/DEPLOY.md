@@ -1,5 +1,12 @@
 # Deploying to the CPU-only pod
 
+> **Archived OSF deployment procedure. Do not run against current pods.**
+> The referenced volume, pod identities and startup assumptions belong to an
+> earlier installation. The procedure is presented for historical analysis of
+> safe service startup and handover practices, not as a current operational
+> instruction. Re-establish configuration and test restore/rollback on an
+> independently provisioned system before adapting these steps.
+
 This system was **built from the GPU pod** (`dokilqcrpplxs3`, EU-RO-1). It is
 intended to **run on the always-on CPU-only pod**. Both mount the same
 `/workspace` network volume (`cmkgi43hcx`), so the code, venv, config and state
