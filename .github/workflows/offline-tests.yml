@@ -8,6 +8,7 @@ on:
       - "tests/**"
       - "config/**"
       - "requirements.lock.txt"
+      - "DEPENDENCY_LICENSES.md"
       - "pytest.ini"
       - "README.md"
       - ".github/workflows/offline-tests.yml"

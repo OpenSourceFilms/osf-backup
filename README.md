@@ -29,6 +29,15 @@ or a claim of sole OSF ownership. It does not change the existing historical
 status, and nothing in this repository is a current B2/restic deployment
 instruction.
 
+## Third-party dependency licences
+
+The 14 Python dependencies pinned in `requirements.lock.txt` have a
+[dated upstream source-licence inventory](DEPENDENCY_LICENSES.md), with links
+to the publishers' actual licence files and distinctions between packages,
+built wheels and external runtime services. These licences **do not
+automatically licence the OSF backup implementation**. The owner/contributor
+rights decision remains open in [issue #1](https://github.com/OpenSourceFilms/osf-backup/issues/1).
+
 ## Public offline CI
 
 This historical snapshot has [automatic offline regression tests](.github/workflows/offline-tests.yml).
