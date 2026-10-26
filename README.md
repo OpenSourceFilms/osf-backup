@@ -12,6 +12,23 @@
 > and confirmation of the deployment target. No actual backup data or
 > credentials are provided here.
 
+## Source availability and reuse status
+
+**Publicly viewable does not currently mean open-source licensed.** This
+historical repository does not yet contain a repository-wide `LICENSE` or
+`COPYING` file. Authorship, third-party materials and the intended
+redistribution licence are being reviewed in
+[issue #1](https://github.com/OpenSourceFilms/osf-backup/issues/1).
+Until an authorised licence is provided, **do not assume that MIT terms from
+other OSF repositories apply here**, or that publication grants general
+permission to redistribute or modify the code beyond GitHub's terms and
+applicable law.
+
+This is a description of the current permission boundary, not a new licence
+or a claim of sole OSF ownership. It does not change the existing historical
+status, and nothing in this repository is a current B2/restic deployment
+instruction.
+
 ## Public offline CI
 
 This historical snapshot has [automatic offline regression tests](.github/workflows/offline-tests.yml).
