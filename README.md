@@ -214,6 +214,14 @@ This does not make a normal multi-entry restore transactional, and does
 not resolve distinct lexical paths that lead to the same target through
 a symlink.
 
+**Directory metadata order:** Directory creation and file restoration finish
+before archived directory modes and modification times are applied. Those
+final metadata operations now run **deepest first**, independent of manifest
+ordering. Otherwise a read-only ancestor restored first could prevent a
+non-root process from finalising nested directories. Three offline cases
+cover both manifest orderings and a read-only tree containing a file.
+This does not make a restore atomic or change permission policy.
+
 This is a correction to the **historical public implementation**, not a
 change or acceptance result for the current B2/restic installation.
 
