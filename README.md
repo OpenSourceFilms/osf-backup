@@ -150,6 +150,28 @@ cd /workspace/_BACKUP
 ./bin/backupctl rebuild-state # reconstruct state.sqlite from remote
 ```
 
+### Historical restore: symlink containment
+
+The `app.restore.restore()` reader now rechecks path containment as
+manifest entries are applied, not only when it first parses the manifest.
+An earlier manifest entry may create a symlink, and a subsequent file
+must not follow that newly created link outside the requested destination.
+The code rechecks containment before creating parent directories or
+reading the corresponding backup object. It also rechecks directories
+before applying final permissions and modification times.
+
+This preserves symlinks pointing **within** the chosen restore tree, while
+refusing out-of-tree writes. Three synthetic tests cover absolute and nested
+escaping symlinks, zero external blob reads on rejection, and valid
+in-tree symlink recovery. These checks do not create a cross-process
+filesystem lock against a concurrently hostile actor changing paths while
+the restore is running. For real recovery, use a newly created,
+access-restricted restore destination and independently inspect the
+snapshot before approving any write to production data.
+
+This is a correction to the **historical public implementation**, not a
+change or acceptance result for the current B2/restic installation.
+
 ## Classification
 
 | Class | Treatment |
