@@ -30,7 +30,6 @@ jobs:
     env:
       AWS_EC2_METADATA_DISABLED: "true"
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-      PYTHONPATH: ".github/offlineguard"
       GIT_TERMINAL_PROMPT: "0"
     steps:
       - name: Checkout public source
@@ -42,6 +41,8 @@ jobs:
       - name: Install locked Python requirements
         run: python -m pip install --disable-pip-version-check -r requirements.lock.txt
       - name: Assert test network guard is active
+        env:
+          PYTHONPATH: ".github/offlineguard"
         run: |
           python -B - <<'PY'
           import socket
@@ -60,4 +61,6 @@ jobs:
                   sock.close()
           PY
       - name: Run non-live backup regression tests
+        env:
+          PYTHONPATH: ".github/offlineguard"
         run: python -B -m pytest -q -m 'not live' --disable-warnings
