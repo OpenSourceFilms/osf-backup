@@ -41,7 +41,7 @@ rights decision remains open in [issue #1](https://github.com/OpenSourceFilms/os
 ## Public offline CI
 
 This historical snapshot has [automatic offline regression tests](.github/workflows/offline-tests.yml).
-They run **240 synthetic/local tests** on a clean Python 3.11 runner, and
+They run **245 synthetic/local tests** on a clean Python 3.11 runner, and
 explicitly exclude the five tests marked `live` that exercise real S3
 storage. Dependency packages are downloaded during environment setup;
 the actual pytest phase runs with no cloud credentials and a Python socket
