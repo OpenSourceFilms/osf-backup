@@ -189,6 +189,17 @@ the restore is running. For real recovery, use a newly created,
 access-restricted restore destination and independently inspect the
 snapshot before approving any write to production data.
 
+Restored symlinks are also staged under a unique same-directory temporary
+name and atomically published with `os.replace()` **only after** the
+replacement link and its metadata are ready. Previously, replacing a regular
+file or symlink first unlinked the existing destination, then attempted to
+create the restored link. A failed link creation could therefore delete
+previously accepted data. Five synthetic regression tests verify that failed
+link creation, timestamp updates or publication leave an existing destination
+intact, that successful replacement works, and that identical symlinks remain
+skipped. The staging approach does **not** make a multi-entry restore
+transactional or defend against an attacker mutating the destination tree.
+
 This is a correction to the **historical public implementation**, not a
 change or acceptance result for the current B2/restic installation.
 

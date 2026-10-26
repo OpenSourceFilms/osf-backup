@@ -646,17 +646,31 @@ def restore(
                     report.skipped_entries += 1
                     continue
 
-                if target.exists() or target.is_symlink():
-                    if target.is_dir() and not target.is_symlink():
-                        raise FileExistsError(
-                            f"cannot replace directory with symlink: {target}"
-                        )
-                    target.unlink()
+                if target.is_dir() and not target.is_symlink():
+                    raise FileExistsError(
+                        f"cannot replace directory with symlink: {target}"
+                    )
 
-                os.symlink(link_target, target)
-                mtime = _entry_mtime(entry)
-                if mtime is not None:
-                    os.utime(target, (mtime, mtime), follow_symlinks=False)
+                # Build the replacement link *before* replacing the old
+                # destination. Unlink-then-symlink would permanently erase a
+                # pre-existing file/link if link creation or utime failed.
+                # The temporary path is in the same directory, so os.replace
+                # publishes it atomically without following the old symlink.
+                fd, temp_name = tempfile.mkstemp(
+                    prefix=".restore-link-", dir=str(target.parent)
+                )
+                os.close(fd)
+                try:
+                    os.unlink(temp_name)
+                    os.symlink(link_target, temp_name)
+                    mtime = _entry_mtime(entry)
+                    if mtime is not None:
+                        os.utime(temp_name, (mtime, mtime), follow_symlinks=False)
+                    _safe_join(dest_root, rel)
+                    os.replace(temp_name, target)
+                finally:
+                    if os.path.lexists(temp_name):
+                        os.unlink(temp_name)
                 report.restored_entries += 1
 
             elif typ == "file":
