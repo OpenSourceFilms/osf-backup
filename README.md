@@ -200,6 +200,20 @@ intact, that successful replacement works, and that identical symlinks remain
 skipped. The staging approach does **not** make a multi-entry restore
 transactional or defend against an attacker mutating the destination tree.
 
+**Duplicate manifest destinations:** A restore now checks the selected
+entries for repeated *normalized* destination paths before creating
+directories or downloading backup objects. For example,
+`/workspace/shot/plate.png` and `workspace/shot/./plate.png` refer to
+the same destination. Without validation, the last entry could silently
+overwrite a different file from an earlier entry while both were counted
+as successfully restored. The restore now reports an ambiguity and applies
+**none of the selected entries** in this case. Four offline synthetic tests
+cover differing and identical duplicate files, directory/file conflicts,
+preservation of previously approved data, and prefix-filtered restores.
+This does not make a normal multi-entry restore transactional, and does
+not resolve distinct lexical paths that lead to the same target through
+a symlink.
+
 This is a correction to the **historical public implementation**, not a
 change or acceptance result for the current B2/restic installation.
 

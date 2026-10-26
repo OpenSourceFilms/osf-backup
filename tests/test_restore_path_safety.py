@@ -108,6 +108,97 @@ def _file_manifest_entry(path: str, payload: bytes) -> dict:
     return {"path": path, "type": "file", "sha256": hashlib.sha256(payload).hexdigest()}
 
 
+class _MappedSyntheticStorage:
+    """Disposable content-addressed object map. Never contacts B2."""
+
+    def __init__(self, *payloads: bytes):
+        self.objects = {
+            f"blobs/sha256/{hashlib.sha256(data).hexdigest()[:2]}/{hashlib.sha256(data).hexdigest()}": data
+            for data in payloads
+        }
+        self.read_keys = []
+
+    def get_object_bytes(self, key: str) -> bytes:
+        self.read_keys.append(key)
+        return self.objects[key]
+
+
+def test_duplicate_normalized_file_path_is_refused_before_any_write(tmp_path):
+    original = b"first-original"
+    replacement = b"second-changed"
+    storage = _MappedSyntheticStorage(original, replacement)
+    root = tmp_path / "destination"
+    existing = root / "workspace" / "shot" / "plate.png"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"previously-approved-plate")
+    manifest = {"entries": [
+        _file_manifest_entry("/workspace/shot/plate.png", original),
+        _file_manifest_entry("workspace/shot/./plate.png", replacement),
+    ]}
+    report = app_restore.restore(storage, manifest, destination=str(root))
+    assert report.total_entries == 2
+    assert report.restored_entries == 0
+    assert report.failed_entries == 1
+    assert report.failures == [{
+        "path": "workspace/shot/plate.png",
+        "error": "duplicate normalized destination path in manifest",
+    }]
+    assert existing.read_bytes() == b"previously-approved-plate"
+    assert storage.read_keys == []
+
+
+def test_duplicate_directory_and_file_path_rejected_before_directory_creation(tmp_path):
+    payload = b"synthetic"
+    storage = _MappedSyntheticStorage(payload)
+    root = tmp_path / "destination"
+    manifest = {"entries": [
+        {"path": "a//b", "type": "dir"},
+        _file_manifest_entry("a/b", payload),
+        {"path": "untouched", "type": "dir"},
+    ]}
+    report = app_restore.restore(storage, manifest, destination=str(root))
+    assert report.failed_entries == 1
+    assert report.restored_entries == 0
+    assert "duplicate normalized" in report.failures[0]["error"]
+    assert not (root / "a").exists()
+    assert not (root / "untouched").exists()
+    assert storage.read_keys == []
+
+
+def test_identical_duplicate_file_entries_are_still_ambiguous(tmp_path):
+    payload = b"single-payload"
+    storage = _MappedSyntheticStorage(payload)
+    file_entry = _file_manifest_entry("shot/matte.png", payload)
+    report = app_restore.restore(
+        storage, {"entries": [file_entry, dict(file_entry)]},
+        destination=str(tmp_path / "destination"),
+    )
+    assert report.restored_entries == 0
+    assert report.failed_entries == 1
+    assert storage.read_keys == []
+    assert not (tmp_path / "destination" / "shot").exists()
+
+
+def test_duplicate_paths_excluded_by_operator_filter_do_not_block_restore(tmp_path):
+    payload = b"retained-selected-file"
+    storage = _MappedSyntheticStorage(payload)
+    root = tmp_path / "destination"
+    manifest = {"entries": [
+        _file_manifest_entry("allowed/payload.bin", payload),
+        {"path": "unselected/other", "type": "dir"},
+        {"path": "/unselected/./other", "type": "symlink", "target": "something"},
+    ]}
+    report = app_restore.restore(
+        storage, manifest, path_filter="allowed", destination=str(root),
+    )
+    assert report.failed_entries == 0
+    assert report.restored_entries == 1
+    assert report.skipped_entries == 2
+    assert (root / "allowed" / "payload.bin").read_bytes() == payload
+    assert not (root / "unselected").exists()
+    assert len(storage.read_keys) == 1
+
+
 def test_manifest_created_absolute_symlink_cannot_redirect_later_file(tmp_path):
     destination = tmp_path / "restored"
     outside = tmp_path / "outside"

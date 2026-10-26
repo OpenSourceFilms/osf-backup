@@ -604,6 +604,27 @@ def restore(
 
         prepared.append((entry, rel_norm, target))
 
+    # A manifest path may appear more than once under different spellings
+    # (for example "/workspace/a" and "workspace/./a"). Without this
+    # preflight the restore would publish several entries to the same final
+    # filename, silently leaving the last blob/link in place while counting
+    # every write as a successful recovery. Reject ambiguous selected entries
+    # before creating directories or reading remote objects.
+    seen_paths: set[str] = set()
+    duplicates: set[str] = set()
+    for _, rel, _ in prepared:
+        if rel in seen_paths:
+            duplicates.add(rel)
+        seen_paths.add(rel)
+    if duplicates:
+        for rel in sorted(duplicates):
+            report.failed_entries += 1
+            report.failures.append({
+                "path": rel,
+                "error": "duplicate normalized destination path in manifest",
+            })
+        return report
+
     # Create directories first so files and symlinks have a place to go.
     dirs_to_finalize: list[tuple[Path, Any, str]] = []
     for entry, rel, target in prepared:
