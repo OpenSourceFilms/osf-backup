@@ -12,6 +12,26 @@
 > and confirmation of the deployment target. No actual backup data or
 > credentials are provided here.
 
+## Public offline CI
+
+This historical snapshot has [automatic offline regression tests](.github/workflows/offline-tests.yml).
+They run **240 synthetic/local tests** on a clean Python 3.11 runner, and
+explicitly exclude the five tests marked `live` that exercise real S3
+storage. Dependency packages are downloaded during environment setup;
+the actual pytest phase runs with no cloud credentials and a Python socket
+guard that rejects IPv4/IPv6 connections.
+
+The previous regression for classifying a clean remote-backed Git checkout
+now builds its own temporary bare Git remote instead of requiring an OSF
+private directory under `/workspace`. This tests the same functionality on
+any clean checkout without touching a production Git repository.
+
+**The network guard is defence in depth for these tests, not a hardened
+sandbox or proof that arbitrary third-party code cannot reach the network.**
+A passing CI result verifies offline unit/integration behaviour, not live
+backup, recovery, credentials, continuity, or suitability for deployment.
+The current OSF B2/restic backup system is separate and is unaffected.
+
 A selective, deduplicating, resumable backup service for the `/workspace`
 network volume, writing to the RunPod network volume `v6a4zjiytb` over its
 S3-compatible API.

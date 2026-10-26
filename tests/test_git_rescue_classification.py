@@ -66,8 +66,28 @@ def test_collection_error_wins_even_when_repo_also_looks_dirty():
     assert len(reasons) == 1  # only the collection-error reason, not a mix
 
 
-def test_real_clean_remote_repo_is_remote_backed_clean():
-    """Integration check against a real repo on disk, not a synthetic fixture."""
-    result = G.classify_repository("/workspace/melb-acquire-bridge")
+def test_real_clean_remote_repo_is_remote_backed_clean(tmp_path):
+    """Use an isolated, locally backed Git remote instead of an OSF worktree."""
+    import subprocess
+
+    remote = tmp_path / "origin.git"
+    checkout = tmp_path / "checkout"
+    def git(*args, cwd=None):
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True,
+            text=True, timeout=15,
+        )
+
+    git("init", "--bare", str(remote))
+    git("init", str(checkout))
+    (checkout / "README.md").write_text("synthetic remote fixture\\n", encoding="utf-8")
+    git("add", "README.md", cwd=checkout)
+    git("-c", "user.name=CI Fixture", "-c", "user.email=ci@example.org",
+        "commit", "-m", "initial fixture", cwd=checkout)
+    git("branch", "-M", "main", cwd=checkout)
+    git("remote", "add", "origin", str(remote), cwd=checkout)
+    git("push", "-u", "origin", "main", cwd=checkout)
+
+    result = G.classify_repository(checkout)
     assert result["classification"] == "REMOTE_BACKED_CLEAN"
     assert result["reasons"] == []
