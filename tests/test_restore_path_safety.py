@@ -16,6 +16,7 @@ import hashlib
 import os
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -153,6 +154,107 @@ def test_manifest_created_relative_symlink_cannot_redirect_nested_file(tmp_path)
     assert (destination / "nested" / "link").is_symlink()
     assert not (outside / "payload.bin").exists()
     assert storage.read_keys == []
+
+
+def test_symlink_creation_failure_preserves_previous_regular_file(tmp_path):
+    destination = tmp_path / "restore"
+    destination.mkdir()
+    existing = destination / "alias"
+    existing.write_bytes(b"previously-accepted-regular-file")
+    manifest = {"entries": [
+        {"type": "symlink", "path": "alias", "target": "replacement.txt"}
+    ]}
+    with mock.patch.object(app_restore.os, "symlink", side_effect=OSError("synthetic link error")):
+        report = app_restore.restore(
+            storage=None, manifest=manifest, destination=str(destination)
+        )
+    assert report.restored_entries == 0
+    assert report.failed_entries == 1
+    assert existing.is_file() and not existing.is_symlink()
+    assert existing.read_bytes() == b"previously-accepted-regular-file"
+    assert list(destination.glob(".restore-link-*")) == []
+
+
+def test_symlink_publication_failure_preserves_previous_symlink(tmp_path):
+    destination = tmp_path / "restore"
+    destination.mkdir()
+    alias = destination / "alias"
+    alias.symlink_to("original.txt")
+    manifest = {"entries": [
+        {"type": "symlink", "path": "alias", "target": "replacement.txt"}
+    ]}
+    with mock.patch.object(app_restore.os, "replace", side_effect=OSError("synthetic publish error")):
+        report = app_restore.restore(
+            storage=None, manifest=manifest, destination=str(destination)
+        )
+    assert report.restored_entries == 0
+    assert report.failed_entries == 1
+    assert alias.is_symlink()
+    assert os.readlink(alias) == "original.txt"
+    assert list(destination.glob(".restore-link-*")) == []
+
+
+def test_symlink_metadata_failure_preserves_previous_file(tmp_path):
+    destination = tmp_path / "restore"
+    destination.mkdir()
+    existing = destination / "alias"
+    existing.write_bytes(b"retain-previous-file")
+    manifest = {"entries": [
+        {"type": "symlink", "path": "alias", "target": "new-target",
+         "mtime": 1_700_000_000}
+    ]}
+    native_utime = app_restore.os.utime
+
+    def refuse_link_timestamp(path, times=None, **kwargs):
+        if kwargs.get("follow_symlinks") is False:
+            raise OSError("synthetic link timestamp failure")
+        return native_utime(path, times, **kwargs)
+
+    with mock.patch.object(app_restore.os, "utime", side_effect=refuse_link_timestamp):
+        report = app_restore.restore(
+            storage=None, manifest=manifest, destination=str(destination)
+        )
+    assert report.failed_entries == 1
+    assert existing.read_bytes() == b"retain-previous-file"
+    assert list(destination.glob(".restore-link-*")) == []
+
+
+def test_successful_symlink_restore_atomically_replaces_previous_file(tmp_path):
+    destination = tmp_path / "restore"
+    destination.mkdir()
+    existing = destination / "alias"
+    existing.write_bytes(b"older-file")
+    manifest = {"entries": [
+        {"type": "symlink", "path": "alias", "target": "new-target"}
+    ]}
+    report = app_restore.restore(
+        storage=None, manifest=manifest, destination=str(destination)
+    )
+    assert report.failed_entries == 0
+    assert report.restored_entries == 1
+    assert existing.is_symlink()
+    assert os.readlink(existing) == "new-target"
+    assert list(destination.glob(".restore-link-*")) == []
+
+
+def test_identical_symlink_is_still_skipped_without_republishing(tmp_path):
+    destination = tmp_path / "restore"
+    destination.mkdir()
+    alias = destination / "alias"
+    alias.symlink_to("unchanged-target")
+    manifest = {"entries": [
+        {"type": "symlink", "path": "alias", "target": "unchanged-target"}
+    ]}
+    with mock.patch.object(app_restore.os, "replace", side_effect=AssertionError(
+        "no re-publication should be performed"
+    )):
+        report = app_restore.restore(
+            storage=None, manifest=manifest, destination=str(destination)
+        )
+    assert report.restored_entries == 0
+    assert report.skipped_entries == 1
+    assert report.failed_entries == 0
+    assert os.readlink(alias) == "unchanged-target"
 
 
 def test_manifest_created_symlink_within_destination_preserves_restore(tmp_path):
