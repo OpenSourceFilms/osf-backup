@@ -611,6 +611,9 @@ def restore(
             continue
 
         try:
+            # A manifest's earlier entry must not turn a previously checked
+            # ancestor into a symlink outside the destination.
+            _safe_join(dest_root, rel)
             if target.is_symlink():
                 raise ValueError(f"directory path is a symlink: {target}")
             target.mkdir(parents=True, exist_ok=True)
@@ -626,7 +629,13 @@ def restore(
             continue
 
         try:
+            # All paths were checked during preparation, but earlier manifest
+            # entries may have created symlinks since then. Recheck *before*
+            # mkdir or object reads so a later entry cannot follow a fresh
+            # link outside the restore root.
+            _safe_join(dest_root, rel)
             target.parent.mkdir(parents=True, exist_ok=True)
+            _safe_join(dest_root, rel)
 
             if typ == "symlink":
                 link_target = _entry_symlink_target(entry)
@@ -713,6 +722,12 @@ def restore(
     # Finalize directory metadata after children have been written.
     for target, entry, rel in dirs_to_finalize:
         try:
+            # The symlink/file pass runs after directory creation, so any
+            # mutable parent and the final directory must be checked again
+            # before chmod/utime, both of which follow symlinks.
+            _safe_join(dest_root, rel)
+            if target.is_symlink() or not target.is_dir():
+                raise ValueError(f"directory path became symlinked or non-directory: {target}")
             mode = _entry_mode(entry, default=0o755)
             os.chmod(target, mode & 0o777)
 

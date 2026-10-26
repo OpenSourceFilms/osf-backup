@@ -12,6 +12,7 @@ checks still run. Containment of the final destination is enforced
 separately by _safe_join. This file locks that fix in.
 """
 
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -89,3 +90,88 @@ def test_safe_join_rejects_traversal_directly(tmp_path):
 def test_safe_join_accepts_ordinary_relative_path(tmp_path):
     target = _safe_join(tmp_path, "a/b/c")
     assert target == tmp_path / "a" / "b" / "c"
+
+class _SyntheticStorage:
+    """Read-only in-memory object store, not a live backup backend."""
+
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self.read_keys = []
+
+    def get_object_bytes(self, key: str) -> bytes:
+        self.read_keys.append(key)
+        return self.payload
+
+
+def _file_manifest_entry(path: str, payload: bytes) -> dict:
+    return {"path": path, "type": "file", "sha256": hashlib.sha256(payload).hexdigest()}
+
+
+def test_manifest_created_absolute_symlink_cannot_redirect_later_file(tmp_path):
+    destination = tmp_path / "restored"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_bytes(b"existing-external-data")
+    payload = b"synthetic-restored-payload"
+    storage = _SyntheticStorage(payload)
+    manifest = {"entries": [
+        {"type": "symlink", "path": "alias", "target": str(outside)},
+        _file_manifest_entry("alias/escape.txt", payload),
+    ]}
+    report = app_restore.restore(
+        storage=storage, manifest=manifest, destination=str(destination)
+    )
+    assert report.total_entries == 2
+    assert report.restored_entries == 1
+    assert report.failed_entries == 1
+    assert "escapes destination root" in report.failures[0]["error"]
+    assert (destination / "alias").is_symlink()
+    assert not (outside / "escape.txt").exists()
+    assert sentinel.read_bytes() == b"existing-external-data"
+    assert storage.read_keys == [], "reject path before reading remote blob"
+
+
+def test_manifest_created_relative_symlink_cannot_redirect_nested_file(tmp_path):
+    destination = tmp_path / "restored"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    payload = b"synthetic-data"
+    storage = _SyntheticStorage(payload)
+    manifest = {"entries": [
+        {"type": "dir", "path": "nested"},
+        {"type": "symlink", "path": "nested/link", "target": str(outside)},
+        _file_manifest_entry("nested/link/payload.bin", payload),
+    ]}
+    report = app_restore.restore(
+        storage=storage, manifest=manifest, destination=str(destination)
+    )
+    assert report.total_entries == 3
+    assert report.restored_entries == 2
+    assert report.failed_entries == 1
+    assert "escapes destination root" in report.failures[0]["error"]
+    assert (destination / "nested" / "link").is_symlink()
+    assert not (outside / "payload.bin").exists()
+    assert storage.read_keys == []
+
+
+def test_manifest_created_symlink_within_destination_preserves_restore(tmp_path):
+    destination = tmp_path / "restored"
+    payload = b"correct-synthetic-file"
+    storage = _SyntheticStorage(payload)
+    manifest = {"entries": [
+        {"type": "dir", "path": "real"},
+        {"type": "symlink", "path": "alias", "target": str(destination / "real")},
+        _file_manifest_entry("alias/document.txt", payload),
+    ]}
+    report = app_restore.restore(
+        storage=storage, manifest=manifest, destination=str(destination)
+    )
+    assert report.total_entries == 3
+    assert report.restored_entries == 3
+    assert report.failed_entries == 0
+    assert (destination / "alias").is_symlink()
+    assert (destination / "real" / "document.txt").read_bytes() == payload
+    assert storage.read_keys == [
+        f"blobs/sha256/{hashlib.sha256(payload).hexdigest()[:2]}/{hashlib.sha256(payload).hexdigest()}"
+    ]
