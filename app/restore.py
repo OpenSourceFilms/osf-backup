@@ -754,7 +754,11 @@ def restore(
             report.failed_entries += 1
             report.failures.append({"path": rel, "error": str(exc)})
 
-    # Finalize directory metadata after children have been written.
+    # Finalize deepest directories first, regardless of manifest order.
+    # Once a parent receives its archived read-only/execute-only mode, a
+    # non-root restorer may no longer be able to chmod/utime its children.
+    # Sorting after the write pass also preserves the existing path checks.
+    dirs_to_finalize.sort(key=lambda item: -len(Path(item[2]).parts))
     for target, entry, rel in dirs_to_finalize:
         try:
             # The symlink/file pass runs after directory creation, so any
