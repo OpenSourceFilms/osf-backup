@@ -326,6 +326,20 @@ class Runner:
                     PRIMARY KEY (path, size, mtime_ns)
                 );
 
+                -- Legacy known_hashes rows have no content-change identity:
+                -- never trust them as hits. A distinct v2 table avoids
+                -- destructive migration of historical backup state.
+                CREATE TABLE IF NOT EXISTS known_hashes_v2 (
+                    path TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    device INTEGER NOT NULL,
+                    inode INTEGER NOT NULL,
+                    ctime_ns INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    PRIMARY KEY (path, size, mtime_ns)
+                );
+
                 CREATE TABLE IF NOT EXISTS runner_blobs (
                     sha256 TEXT PRIMARY KEY,
                     size INTEGER NOT NULL,
@@ -966,21 +980,42 @@ class Runner:
     # ------------------------------------------------------------------
     # Hash helpers
     # ------------------------------------------------------------------
-    def _known_hash(self, path: Path, size: int, mtime_ns: int) -> str | None:
+    @staticmethod
+    def _source_identity(path: Path, expected_size: int,
+                         expected_mtime_ns: int) -> tuple[int, int, int]:
+        """Identity for a reusable hash, not a substitute for content hashing.
+
+        Same-size rewrites can preserve mtime, but replacing the inode or
+        writing new content updates inode/ctime. A missing or changed source
+        fails closed instead of using a previous snapshot's digest.
+        """
+        st = path.stat()
+        if st.st_size != expected_size or st.st_mtime_ns != expected_mtime_ns:
+            raise ActiveFileError(f"{path} changed since the backup scan")
+        return (st.st_dev, st.st_ino, st.st_ctime_ns)
+
+    def _known_hash(self, path: Path, size: int, mtime_ns: int,
+                    identity: tuple[int, int, int]) -> str | None:
         row = self.state_db.execute(
-            "SELECT sha256 FROM known_hashes WHERE path = ? AND size = ? AND mtime_ns = ?",
-            (str(path), size, mtime_ns),
+            """
+            SELECT sha256 FROM known_hashes_v2
+             WHERE path = ? AND size = ? AND mtime_ns = ?
+               AND device = ? AND inode = ? AND ctime_ns = ?
+            """,
+            (str(path), size, mtime_ns, *identity),
         ).fetchone()
         return row["sha256"] if row else None
 
-    def _remember_hash(self, path: Path, size: int, mtime_ns: int, sha256: str) -> None:
+    def _remember_hash(self, path: Path, size: int, mtime_ns: int,
+                       sha256: str, identity: tuple[int, int, int]) -> None:
         with self.state_db:
             self.state_db.execute(
                 """
-                INSERT OR REPLACE INTO known_hashes (path, size, mtime_ns, sha256)
-                VALUES (?, ?, ?, ?)
+                INSERT OR REPLACE INTO known_hashes_v2
+                    (path, size, mtime_ns, device, inode, ctime_ns, sha256)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (str(path), size, mtime_ns, sha256),
+                (str(path), size, mtime_ns, *identity, sha256),
             )
 
     def _sha256_file(
@@ -1008,7 +1043,10 @@ class Runner:
                 h.update(chunk)
 
         after = file_path.stat()
-        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+        if ((before.st_size, before.st_mtime_ns, before.st_dev,
+             before.st_ino, before.st_ctime_ns) !=
+            (after.st_size, after.st_mtime_ns, after.st_dev,
+             after.st_ino, after.st_ctime_ns)):
             raise ActiveFileError(f"{file_path} changed while hashing")
 
         if expected_size is not None and after.st_size != expected_size:
@@ -1191,12 +1229,22 @@ class Runner:
             mtime_ns = int(row["mtime_ns"])
 
             try:
-                sha = self._known_hash(path, size, mtime_ns)
+                # The legacy path/size/mtime cache cannot distinguish a
+                # same-size replacement whose mtime was preserved. Bind any
+                # reusable hash to the actual upload file's inode/change time,
+                # which may differ from the logical path for staged entries.
+                source_identity = self._source_identity(upload_path, size, mtime_ns)
+                sha = self._known_hash(path, size, mtime_ns, source_identity)
                 if not sha:
                     sha = self._sha256_file(
                         upload_path, expected_size=size, expected_mtime_ns=mtime_ns
                     )
-                    self._remember_hash(path, size, mtime_ns, sha)
+                    if self._source_identity(upload_path, size, mtime_ns) != source_identity:
+                        raise ActiveFileError(f"{upload_path} changed while hashing")
+                    self._remember_hash(path, size, mtime_ns, sha, source_identity)
+
+                if self._source_identity(upload_path, size, mtime_ns) != source_identity:
+                    raise ActiveFileError(f"{upload_path} changed before upload")
 
                 local = self._get_local_blob(sha)
                 head = None

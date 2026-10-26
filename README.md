@@ -105,6 +105,26 @@ Three failure modes drive every design decision:
 - **Restore does not depend on local state.** `state.sqlite` is a cache. The
   remote manifests are the authoritative recovery record.
 
+### Cached SHA-256 integrity
+
+The hash cache is an optimization, not authority over source contents.
+Path, byte count and modification time are **not sufficient** to reuse an
+earlier digest: applications can replace files with new bytes of identical
+size while preserving `mtime`. The runner's `known_hashes_v2` records
+therefore also bind each digest to the actual upload source's device, inode
+and filesystem change time (`ctime_ns`). The first run after upgrading
+rehashes files that have only legacy `known_hashes` entries; those historical
+records are left intact but never trusted as cache hits. Staged database or
+git-rescue artifacts are checked against the **staged file**, not merely
+their logical source path. Changes detected while hashing or between source
+checks make that entry fail/defer rather than reusing a stale hash.
+
+These metadata checks prevent the common same-size/same-mtime replacement
+failure mode, but do **not** constitute an immutable filesystem snapshot,
+a guarantee against hostile concurrent mutation or a substitute for remote
+blob verification. The public patch does not alter any running backup daemon
+or state database until an independently approved deployment.
+
 ## Layout
 
 ```
