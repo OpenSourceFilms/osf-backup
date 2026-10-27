@@ -6,12 +6,13 @@ licence files in the publishers' official repositories on the review date.
 It is a source-level reference, **not** a legal clearance or a complete
 software bill of materials for an installed Python environment.
 
-**Important:** this historical public repository has **no root open-source
-licence**. Its published visibility does not automatically grant permission
-to copy, modify or redistribute OSF-authored source code. See the
-[unresolved owner/licence decision](https://github.com/OpenSourceFilms/osf-backup/issues/1).
-The permissive licences below cover **their respective upstream projects**;
-they do **not** grant rights to the independent OSF backup implementation.
+**OSF-controlled original source is MIT-licensed**, subject to the scope
+and exclusions in [LICENSE](LICENSE) and
+[LICENSING_SCOPE.md](LICENSING_SCOPE.md). The packages listed below are
+separately licensed upstream. Their licences do not confer or limit OSF's
+independent MIT grant over source it has the right to license.
+They do not grant reuse of external packages, backup data or third-party
+content on behalf of those owners.
 
 ## Published Python dependency licences
 
