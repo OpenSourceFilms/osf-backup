@@ -12,22 +12,20 @@
 > and confirmation of the deployment target. No actual backup data or
 > credentials are provided here.
 
-## Source availability and reuse status
+## Licence and reuse status
 
-**Publicly viewable does not currently mean open-source licensed.** This
-historical repository does not yet contain a repository-wide `LICENSE` or
-`COPYING` file. Authorship, third-party materials and the intended
-redistribution licence are being reviewed in
-[issue #1](https://github.com/OpenSourceFilms/osf-backup/issues/1).
-Until an authorised licence is provided, **do not assume that MIT terms from
-other OSF repositories apply here**, or that publication grants general
-permission to redistribute or modify the code beyond GitHub's terms and
-applicable law.
+**MIT for original source code and documentation under OSF or contributor
+licensing control**, per [LICENSE](LICENSE) and the exclusions in
+[LICENSING_SCOPE.md](LICENSING_SCOPE.md). Third-party Python packages,
+external runtimes and other independently owned material are **not**
+relicensed by that grant. The original commit history and subsequent OSF
+maintainer history provide authorship evidence, not a complete independent
+chain-of-title audit. Any competing ownership or notice issue remains
+tracked in [issue #1](https://github.com/OpenSourceFilms/osf-backup/issues/1).
 
-This is a description of the current permission boundary, not a new licence
-or a claim of sole OSF ownership. It does not change the existing historical
-status, and nothing in this repository is a current B2/restic deployment
-instruction.
+This is a **historical implementation**, not the current B2/restic
+deployment. Licensing the source does not authorise applying archived
+operations to live storage or prove successful production recovery.
 
 ## Third-party dependency licences
 
